@@ -1715,48 +1715,26 @@ def cmd_render(args) -> int:
     out.append(f"- you interrupted **{packet['interrupts']}** times\n")
     out.append(f"> {cov['note']}\n")
 
-    # Synthesis, when present, replaces theorist-grouped output with a single
-    # ordered read. Three parallel readers cannot give a report a spine; this is
-    # the stage that does, without adding claims or deleting any.
-    syn = json.loads(Path(args.synthesis).read_text()) if args.synthesis else None
-    if syn:
-        by = {f["theorist"]: f["claims"] for f in kept}
-        out.append("## The read\n")
-        out.append(syn.get("opening", "").strip() + "\n")
-        seen = set()
-        for step in syn.get("order", []):
-            claims = by.get(step.get("theorist")) or []
-            i = step.get("index", -1)
-            if not (0 <= i < len(claims)):
-                continue
-            key = (step["theorist"], i)
-            if key in seen:
-                continue
-            seen.add(key)
-            c = claims[i]
-            if step.get("bridge"):
-                out.append(f"*{step['bridge'].strip()}*\n")
-            out.append(f"{c['claim']}\n")
-            _emit_evidence(out, c, source_text, for_display, records,
+    # Analyst mode: one voice, merged sections, second person. The panel is the
+    # reasoning; this is the report. Quotes are still placed by the renderer
+    # from source, which is the only reason none of them can be fabricated.
+    ana = json.loads(Path(args.analysis).read_text()) if args.analysis else None
+    seen_turns: set = set()
+    if ana:
+        for sec in ana.get("sections", []):
+            out.append(f"## {sec.get('heading', '').strip()}\n")
+            out.append(sec.get("body", "").strip() + "\n")
+            ev = [t for t in sec.get("evidence", []) if t not in seen_turns]
+            seen_turns.update(ev)
+            _emit_evidence(out, {"evidence": ev, "quote": None},
+                           source_text, for_display, records,
                            args.quotes_per_claim)
-            out.append(f"<sub>— {step['theorist']}</sub>\n")
-        # Anything the synthesist forgot still gets printed. Silent loss is
-        # worse than an untidy tail.
-        for f in kept:
-            for i, c in enumerate(f["claims"]):
-                if (f["theorist"], i) in seen:
-                    continue
-                out.append(f"{c['claim']}\n")
-                _emit_evidence(out, c, source_text, for_display, records,
-                               args.quotes_per_claim)
-                out.append(f"<sub>— {f['theorist']}</sub>\n")
-        if syn.get("tensions"):
-            out.append("## Where they disagree\n")
-            for t in syn["tensions"]:
-                out.append(f"- {t}")
-            out.append("")
+            if sec.get("lenses"):
+                out.append(f"<sub>{' · '.join(sec['lenses'])}</sub>\n")
+        if ana.get("closing"):
+            out.append(ana["closing"].strip() + "\n")
 
-    for f in ([] if syn else kept):
+    for f in ([] if ana else kept):
         out.append(f"## {f.get('theorist', 'panel').title()}\n")
         for c in f["claims"]:
             out.append(f"{c['claim']}\n")
@@ -1773,6 +1751,27 @@ def cmd_render(args) -> int:
         out.append("")
 
     text = "\n".join(out)
+
+    # Pronoun audit. The report addresses the reader as "you" because nobody
+    # told the panel this person's gender -- a third-person pronoun about the
+    # reader is a guess drawn from their own transcript, and a wrong guess means
+    # intimate analysis delivered to someone it has misidentified. Sentences
+    # naming a theorist are exempt; those pronouns refer to Freud, not to you.
+    THIRD = re.compile(r"\b(he|him|his|she|her|hers)\b", re.I)
+    NAMES = re.compile(r"\b(freud|jung|goffman|analyst)\b", re.I)
+    suspect = []
+    for line in text.splitlines():
+        if line.startswith((">", "#", "<sub")):
+            continue
+        for sent in re.findall(r"[^.!?\n]+[.!?]", line):
+            if THIRD.search(sent) and not NAMES.search(sent):
+                suspect.append(" ".join(sent.split())[:110])
+    if suspect:
+        print(f"  WARNING: {len(suspect)} sentence(s) may refer to the reader in "
+              f"the third person:", file=sys.stderr)
+        for x in suspect[:5]:
+            print(f"    {x}", file=sys.stderr)
+
     dest = Path(args.out) if args.out else REPORT_HOME / "reports" / "report.md"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(text)
@@ -1856,7 +1855,7 @@ def main(argv=None) -> int:
     rn.add_argument("--findings", required=True, help="jsonl, one object per theorist")
     rn.add_argument("--out")
     rn.add_argument("--quotes-per-claim", type=int, default=2)
-    rn.add_argument("--synthesis", help="synthesist output; gives the report a spine")
+    rn.add_argument("--analysis", help="analyst output; one voice, merged sections")
     rn.add_argument("--share", action="store_true",
                     help="keep pseudonyms instead of restoring real names")
     rn.set_defaults(func=cmd_render)
