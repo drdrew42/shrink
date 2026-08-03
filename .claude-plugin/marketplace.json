@@ -1,6 +1,9 @@
 {
   "name": "drdrew42",
-  "owner": "drdrew42",
+  "owner": {
+    "name": "drdrew42",
+    "url": "https://github.com/drdrew42"
+  },
   "plugins": [
     {
       "name": "shrink",
