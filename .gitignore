@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Never commit corpus extracts or reports — they are the user's own history.
+corpus.json
+reports/
+eval/labels.jsonl

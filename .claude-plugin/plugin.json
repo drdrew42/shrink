@@ -1,0 +1,5 @@
+{
+  "name": "shrink",
+  "version": "0.1.0",
+  "description": "Reads your own Claude Code history and hands back a psychological read of you: a dry statistical tier that is sincere, and a panel of theorists who over-read it on purpose."
+}

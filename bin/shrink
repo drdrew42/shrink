@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""shrink — read your own Claude Code history and hand back a read of you.
+
+Single binary, stdlib only. Everything the plugin does goes through here so the
+user needs exactly one permission rule: Bash(shrink:*).
+
+Subcommands
+    digest    extract + denoise + dry-tier stats
+    sample    emit a stratified labeling set (M1 eval)
+    excerpt   fetch context around a turn id          [M3]
+    verify    check a quote byte-exact against source [M3]
+    render    build the report                        [M5]
+    purge     wipe reports and cache
+
+Design contracts live in SCHEMA.md. The short version: the JSONL format is
+internal and unstable, so this is an archaeologist — it skips bad lines, keeps
+unknowns rather than dropping them, and stamps everything with the build that
+wrote it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import statistics
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+SUMMARY_VERSION = 1  # bump to force re-derivation of cached output
+
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+PROJECTS_DIR = CLAUDE_HOME / "projects"
+HISTORY_FILE = CLAUDE_HOME / "history.jsonl"
+
+# Directories that live *inside* a project dir but are not sessions.
+EXCLUDED_SUBDIRS = {"subagents", "tool-results"}
+
+# Blocks injected into authored turns. Stripped, never used to discard a turn:
+# a reminder appended to something you typed does not make it not-yours.
+WRAPPER_RE = re.compile(
+    r"<(system-reminder|command-name|command-message|command-args|"
+    r"command-contents|local-command-stdout|local-command-stderr)>"
+    r".*?</\1>|<\1\s*/>",
+    re.DOTALL,
+)
+# Unclosed variants show up when output was truncated mid-write.
+DANGLING_RE = re.compile(
+    r"<(system-reminder|command-name|command-message|command-args|"
+    r"command-contents|local-command-stdout|local-command-stderr)>.*\Z",
+    re.DOTALL,
+)
+
+
+# --------------------------------------------------------------------------
+# discovery
+# --------------------------------------------------------------------------
+
+def session_files(projects_dir: Path = PROJECTS_DIR) -> list[Path]:
+    """Top-level <UUID>.jsonl per project dir only.
+
+    Both known subagent layouts are excluded: the flat `agent-*.jsonl` of older
+    builds and the nested `<session>/subagents/` of current ones. A recursive
+    glob here would ingest subagent prose as if the human wrote it.
+    """
+    out: list[Path] = []
+    if not projects_dir.is_dir():
+        return out
+    for proj in sorted(projects_dir.iterdir()):
+        if not proj.is_dir():
+            continue
+        for f in sorted(proj.glob("*.jsonl")):
+            if f.name.startswith("agent-"):
+                continue
+            out.append(f)
+    return out
+
+
+def project_label(path: Path) -> str:
+    """Mangled cwd -> the original path, best effort."""
+    return "/" + path.parent.name.lstrip("-").replace("-", "/")
+
+
+# --------------------------------------------------------------------------
+# normalization
+# --------------------------------------------------------------------------
+
+class Turn:
+    __slots__ = (
+        "turn_id", "session_id", "uuid", "parent_uuid", "ts", "project",
+        "kind", "text", "raw_len", "segment", "line_no", "build",
+        "looks_pasted", "role",
+    )
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw.get(k))
+
+    def as_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self.__slots__}
+
+
+def strip_wrappers(text: str) -> str:
+    text = WRAPPER_RE.sub("", text)
+    text = DANGLING_RE.sub("", text)
+    return text.strip()
+
+
+def looks_pasted(text: str) -> bool:
+    """Size + newline density. A flag, not a verdict — the eval set adjudicates."""
+    if len(text) < 1500:
+        return False
+    lines = text.count("\n") + 1
+    return lines >= 20 and (len(text) / lines) < 120
+
+
+def extract_text(content) -> tuple[str | None, str]:
+    """Return (text, reason). text is None when the record is not authored."""
+    if isinstance(content, str):
+        return content, "string"
+    if isinstance(content, list):
+        kinds = {b.get("type") for b in content if isinstance(b, dict)}
+        if "tool_result" in kinds:
+            return None, "tool_result"
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        if not parts:
+            return None, "no_text_block"
+        return "\n".join(parts), "text_block"
+    return None, "unrecognized_content"
+
+
+def classify(rec: dict) -> tuple[str, str]:
+    """(kind, reason) for a type:"user" record.
+
+    kind is one of: authored, tool_result, meta, sidechain, empty, unrecognized.
+    Order matters — toolUseResult carries ~86% of the discrimination.
+    """
+    if rec.get("toolUseResult") is not None:
+        return "tool_result", "toolUseResult"
+    if rec.get("isSidechain"):
+        return "sidechain", "isSidechain"
+    if rec.get("userType") not in (None, "external"):
+        return "sidechain", "userType"
+    text, reason = extract_text(rec.get("message", {}).get("content"))
+    if text is None:
+        return ("tool_result", reason) if reason == "tool_result" else ("unrecognized", reason)
+    if rec.get("isMeta"):
+        return "meta", "isMeta"
+    if not strip_wrappers(text):
+        return "empty", "wrappers_only"
+    return "authored", reason
+
+
+def read_session(path: Path) -> tuple[list[Turn], Counter]:
+    """Parse one session file. Never throws on content."""
+    turns: list[Turn] = []
+    stats: Counter = Counter()
+    session_id = path.stem
+    project = project_label(path)
+    segment = 0
+
+    with path.open(errors="replace") as fh:
+        for line_no, line in enumerate(fh):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                stats["unparseable_lines"] += 1
+                continue
+            if not isinstance(rec, dict):
+                stats["non_object_lines"] += 1
+                continue
+
+            rtype = rec.get("type")
+            stats[f"type:{rtype}"] += 1
+
+            # Segment breaks: compaction and any orphan root. Ordering never
+            # crosses one of these — see SCHEMA.md / amendment A14.
+            if rtype == "system" and rec.get("subtype") == "compact_boundary":
+                segment += 1
+                stats["compact_boundaries"] += 1
+                continue
+            if rtype in ("user", "assistant") and line_no and rec.get("parentUuid") is None:
+                segment += 1
+                stats["orphan_roots"] += 1
+
+            if rtype == "assistant":
+                # Metadata only. Text is fetched on demand by `excerpt`.
+                stats["assistant_turns"] += 1
+                continue
+            if rtype != "user":
+                continue
+
+            kind, reason = classify(rec)
+            stats[f"user:{kind}"] += 1
+            stats[f"reason:{reason}"] += 1
+            if kind != "authored":
+                continue
+
+            raw, _ = extract_text(rec.get("message", {}).get("content"))
+            text = strip_wrappers(raw or "")
+            uid = rec.get("uuid") or f"line{line_no}"
+            turns.append(Turn(
+                turn_id=f"{session_id}:{uid}",
+                session_id=session_id,
+                uuid=uid,
+                parent_uuid=rec.get("parentUuid"),
+                ts=rec.get("timestamp"),
+                project=project,
+                kind="authored",
+                text=text,
+                raw_len=len(raw or ""),
+                segment=segment,
+                line_no=line_no,
+                build=rec.get("version"),
+                looks_pasted=looks_pasted(text),
+                role="user",
+            ))
+
+    return turns, stats
+
+
+def read_history(path: Path = HISTORY_FILE) -> list[dict]:
+    """The long-baseline tier. Authored prompts only, survives the 30-day sweep."""
+    out: list[dict] = []
+    if not path.is_file():
+        return out
+    for line in path.open(errors="replace"):
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        text = rec.get("display")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        out.append({
+            "text": strip_wrappers(text),
+            "ts": rec.get("timestamp"),
+            "project": rec.get("project"),
+            "session_id": rec.get("sessionId"),
+        })
+    return out
+
+
+# --------------------------------------------------------------------------
+# corpus
+# --------------------------------------------------------------------------
+
+class Corpus:
+    def __init__(self, turns, stats, files, history):
+        self.turns = turns
+        self.stats = stats
+        self.files = files
+        self.history = history
+
+    @classmethod
+    def load(cls, days: int | None = None) -> "Corpus":
+        files = session_files()
+        turns: list[Turn] = []
+        stats: Counter = Counter()
+        seen_uuids: dict[str, str] = {}
+        for f in files:
+            t, s = read_session(f)
+            stats.update(s)
+            for turn in t:
+                # Cheap insurance against resume-replay. Not observed on the
+                # reference build, but free.
+                prior = seen_uuids.get(turn.uuid)
+                if prior and prior != turn.session_id:
+                    stats["replayed_uuids"] += 1
+                    continue
+                seen_uuids[turn.uuid] = turn.session_id
+                turns.append(turn)
+        turns.sort(key=lambda t: (t.ts or "", t.session_id, t.line_no))
+        history = read_history()
+
+        if days:
+            cutoff = _cutoff(days)
+            if cutoff:
+                turns = [t for t in turns if (t.ts or "") >= cutoff]
+        return cls(turns, stats, files, history)
+
+    @property
+    def authored_chars(self) -> int:
+        return sum(len(t.text) for t in self.turns)
+
+
+def _cutoff(days: int) -> str | None:
+    """ISO cutoff string, derived from the newest record rather than wall clock
+    so a stale corpus doesn't silently return nothing."""
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (now - datetime.timedelta(days=days)).isoformat().replace("+00:00", "Z")
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_digest(args) -> int:
+    corpus = Corpus.load(days=args.days)
+    if not corpus.files:
+        print(f"No sessions found under {PROJECTS_DIR}.", file=sys.stderr)
+        return 2
+
+    s = corpus.stats
+    user_total = sum(v for k, v in s.items() if k.startswith("user:"))
+    authored = s.get("user:authored", 0)
+
+    print(f"shrink digest  (SUMMARY_VERSION {SUMMARY_VERSION})")
+    print(f"  sessions       {len(corpus.files)}")
+    print(f"  window         {args.days} days" if args.days else "  window         all")
+    print()
+    print("  denoiser")
+    print(f"    user records      {user_total:>8,}")
+    for kind in ("authored", "tool_result", "meta", "sidechain", "empty", "unrecognized"):
+        n = s.get(f"user:{kind}", 0)
+        if n:
+            pct = 100 * n / user_total if user_total else 0
+            print(f"      {kind:<16} {n:>8,}  {pct:5.1f}%")
+    print(f"    assistant turns   {s.get('assistant_turns', 0):>8,}  (metadata only)")
+    print()
+    print("  corpus")
+    print(f"    authored turns    {len(corpus.turns):>8,}")
+    print(f"    authored chars    {corpus.authored_chars:>8,}")
+    if corpus.turns:
+        lens = [len(t.text) for t in corpus.turns]
+        print(f"    median turn       {int(statistics.median(lens)):>8,} chars")
+        print(f"    span              {corpus.turns[0].ts} -> {corpus.turns[-1].ts}")
+        pasted = sum(1 for t in corpus.turns if t.looks_pasted)
+        print(f"    flagged as paste  {pasted:>8,}")
+    print()
+    print("  long baseline (history.jsonl)")
+    if corpus.history:
+        hs = [h["ts"] for h in corpus.history if h.get("ts")]
+        print(f"    prompts           {len(corpus.history):>8,}")
+        print(f"    projects          {len({h.get('project') for h in corpus.history}):>8,}")
+        if hs:
+            import datetime
+            fmt = lambda t: datetime.datetime.fromtimestamp(
+                t / 1000 if t > 1e11 else t).date()
+            print(f"    span              {fmt(min(hs))} -> {fmt(max(hs))}")
+    else:
+        print("    (none found)")
+
+    builds = Counter(t.build for t in corpus.turns if t.build)
+    if builds:
+        print()
+        print("  builds observed   " + ", ".join(
+            f"{b} ({n})" for b, n in builds.most_common(6)))
+
+    unknown = {k[5:]: v for k, v in s.items()
+               if k.startswith("type:") and k[5:] not in KNOWN_TYPES}
+    if unknown:
+        print()
+        print("  UNKNOWN record types (archived, not dropped):")
+        for t, n in sorted(unknown.items(), key=lambda kv: -kv[1]):
+            print(f"    {t:<28} {n:>8,}")
+
+    for key, label in (("unparseable_lines", "unparseable lines"),
+                       ("replayed_uuids", "replayed uuids dropped"),
+                       ("compact_boundaries", "compact boundaries"),
+                       ("orphan_roots", "orphan segment roots")):
+        if s.get(key):
+            print(f"  {label}: {s[key]:,}")
+
+    if args.json:
+        Path(args.json).write_text(json.dumps(
+            {"summary_version": SUMMARY_VERSION,
+             "stats": dict(s),
+             "turns": [t.as_dict() for t in corpus.turns]},
+            indent=2))
+        print(f"\n  wrote {args.json}")
+    return 0
+
+
+KNOWN_TYPES = {
+    "user", "assistant", "system", "attachment", "last-prompt", "mode",
+    "permission-mode", "queue-operation", "ai-title", "bridge-session",
+    "file-history-snapshot", "file-history-delta", "pr-link", "summary",
+    "progress", "custom-title", "agent-name",
+}
+
+
+def cmd_sample(args) -> int:
+    """Stratified labeling set for the M1 precision eval.
+
+    Deliberately samples across the *decision boundary*, not the easy middle:
+    every kind, plus the wrapper-heavy and paste-flagged cases where the rule is
+    most likely to be wrong.
+    """
+    files = session_files()
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for f in files:
+        session_id = f.stem
+        for line_no, line in enumerate(f.open(errors="replace")):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(rec, dict) or rec.get("type") != "user":
+                continue
+            kind, reason = classify(rec)
+            raw, _ = extract_text(rec.get("message", {}).get("content"))
+            raw = raw or ""
+            stripped = strip_wrappers(raw)
+            bucket = kind
+            if kind == "authored" and raw != stripped:
+                bucket = "authored_wrapped"
+            if kind == "authored" and looks_pasted(stripped):
+                bucket = "authored_paste_flagged"
+            buckets[bucket].append({
+                "turn_id": f"{session_id}:{rec.get('uuid') or line_no}",
+                "predicted": kind,
+                "reason": reason,
+                "label": None,
+                "excerpt": stripped[:600] if stripped else raw[:600],
+                "raw_len": len(raw),
+            })
+
+    per = max(1, args.n // max(1, len(buckets)))
+    out: list[dict] = []
+    for bucket, items in sorted(buckets.items()):
+        step = max(1, len(items) // per)
+        picked = items[::step][:per]
+        for row in picked:
+            row["bucket"] = bucket
+        out.extend(picked)
+
+    dest = Path(args.out)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("w") as fh:
+        for row in out:
+            fh.write(json.dumps(row) + "\n")
+
+    print(f"wrote {len(out)} rows to {dest}")
+    for bucket, items in sorted(buckets.items()):
+        n = sum(1 for r in out if r["bucket"] == bucket)
+        print(f"  {bucket:<24} sampled {n:>4}  of {len(items):>7,}")
+    print("\nSet \"label\" on each row to the true kind, then: shrink eval")
+    return 0
+
+
+def cmd_eval(args) -> int:
+    """Score the denoiser against hand labels."""
+    path = Path(args.labels)
+    if not path.is_file():
+        print(f"No label file at {path}. Run `shrink sample` first.", file=sys.stderr)
+        return 2
+    rows = [json.loads(l) for l in path.open() if l.strip()]
+    labeled = [r for r in rows if r.get("label")]
+    if not labeled:
+        print(f"{len(rows)} rows, none labeled yet.", file=sys.stderr)
+        return 2
+
+    tp = sum(1 for r in labeled if r["predicted"] == "authored" and r["label"] == "authored")
+    fp = sum(1 for r in labeled if r["predicted"] == "authored" and r["label"] != "authored")
+    fn = sum(1 for r in labeled if r["predicted"] != "authored" and r["label"] == "authored")
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+
+    print(f"labeled {len(labeled)} of {len(rows)}")
+    print(f"  precision  {precision:.3f}   (target >= 0.95)")
+    print(f"  recall     {recall:.3f}")
+    print(f"  tp {tp}  fp {fp}  fn {fn}")
+    if fp or fn:
+        print("\nmisclassified:")
+        for r in labeled:
+            hit = r["predicted"] == "authored"
+            truth = r["label"] == "authored"
+            if hit != truth:
+                print(f"  [{r['bucket']}] predicted={r['predicted']} label={r['label']}"
+                      f"  reason={r['reason']}\n    {r['excerpt'][:160]!r}")
+    return 0 if precision >= 0.95 else 1
+
+
+def cmd_stub(name: str):
+    def run(args) -> int:
+        print(f"`shrink {name}` is not implemented yet.", file=sys.stderr)
+        return 3
+    return run
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="shrink", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("digest", help="extract + denoise + dry-tier stats")
+    d.add_argument("--days", type=int, default=None,
+                   help="window in days (default: all available)")
+    d.add_argument("--json", metavar="PATH", help="also write the normalized corpus")
+    d.set_defaults(func=cmd_digest)
+
+    s = sub.add_parser("sample", help="emit a stratified labeling set")
+    s.add_argument("-n", type=int, default=200)
+    s.add_argument("--out", default="eval/labels.jsonl")
+    s.set_defaults(func=cmd_sample)
+
+    e = sub.add_parser("eval", help="score the denoiser against hand labels")
+    e.add_argument("--labels", default="eval/labels.jsonl")
+    e.set_defaults(func=cmd_eval)
+
+    for name, helptext in (("excerpt", "fetch context around a turn id [M3]"),
+                           ("verify", "check a quote against source [M3]"),
+                           ("render", "build the report [M5]"),
+                           ("purge", "wipe reports and cache")):
+        sp = sub.add_parser(name, help=helptext)
+        sp.set_defaults(func=cmd_stub(name))
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
