@@ -2049,6 +2049,19 @@ def cmd_render(args) -> int:
     print(f"wrote {dest}")
     print(f"  {sum(len(f['claims']) for f in kept)} claims kept, "
           f"{len(dropped)} dropped")
+    # Provenance. The pipeline is driven by a model following prose, so the
+    # failure mode is not a crash -- it is a plausible report produced by a
+    # shortcut. Silence about which lenses actually ran would hide exactly that.
+    who = [f.get("theorist", "?") for f in kept]
+    expected = {"freud", "jung", "goffman"}
+    print(f"  lenses: {', '.join(sorted(who)) or 'none'}")
+    if not expected.issubset(set(who)):
+        print(f"  WARNING: expected {sorted(expected)} — "
+              f"missing {sorted(expected - set(who))}. A report built from "
+              f"fewer lenses has no disagreement to keep.", file=sys.stderr)
+    if args.analysis is None:
+        print("  NOTE: no --analysis; output is theorist-grouped, not a single "
+              "analyst voice.")
     print("  This report is overwritten by the next run. Save it if you want it.")
     return 0
 
