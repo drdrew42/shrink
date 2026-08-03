@@ -2,9 +2,10 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# Never commit corpus extracts or reports — they are the user's own history.
-corpus.json
+# Never commit anything derived from a real corpus. These files contain the
+# user's own prompts verbatim. Whole directories, not named files — a new file
+# dropped in here must not become a leak.
+eval/
 reports/
-eval/labels.jsonl
-
-eval/holdout.jsonl
+*.corpus.json
+corpus.json
