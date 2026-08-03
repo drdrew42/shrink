@@ -31,6 +31,9 @@ from pathlib import Path
 
 SUMMARY_VERSION = 1  # bump to force re-derivation of cached output
 
+PLUGIN_ROOT = Path(os.environ.get(
+    "CLAUDE_PLUGIN_ROOT", Path(__file__).resolve().parent.parent))
+
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
 PROJECTS_DIR = CLAUDE_HOME / "projects"
 HISTORY_FILE = CLAUDE_HOME / "history.jsonl"
@@ -485,6 +488,93 @@ def cmd_eval(args) -> int:
     return 0 if precision >= 0.95 else 1
 
 
+def cmd_label(args) -> int:
+    """Serve a local labeling UI over the eval set.
+
+    Local-only by design: the rows contain verbatim excerpts of the user's own
+    prompts, so this binds loopback unless explicitly told otherwise.
+    """
+    import http.server
+    import socketserver
+    import threading
+
+    path = Path(args.labels)
+    if not path.is_file():
+        print(f"No label file at {path}. Run `shrink sample` first.", file=sys.stderr)
+        return 2
+
+    page = PLUGIN_ROOT / "web" / "label.html"
+    if not page.is_file():
+        print(f"Missing UI asset: {page}", file=sys.stderr)
+        return 2
+
+    rows = [json.loads(l) for l in path.open() if l.strip()]
+    index = {r["turn_id"]: r for r in rows}
+    lock = threading.Lock()
+
+    def flush():
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w") as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        tmp.replace(path)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):  # quiet
+            pass
+
+        def _send(self, code, body: bytes, ctype="application/json"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self._send(200, page.read_bytes(), "text/html; charset=utf-8")
+            elif self.path == "/api/rows":
+                with lock:
+                    self._send(200, json.dumps(rows).encode())
+            else:
+                self._send(404, b'{"error":"not found"}')
+
+        def do_POST(self):
+            if self.path != "/api/label":
+                self._send(404, b'{"error":"not found"}')
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(n) or b"{}")
+            except (json.JSONDecodeError, ValueError):
+                self._send(400, b'{"error":"bad json"}')
+                return
+            row = index.get(payload.get("turn_id"))
+            if row is None:
+                self._send(404, b'{"error":"unknown turn_id"}')
+                return
+            with lock:
+                row["label"] = payload.get("label")
+                flush()
+                done = sum(1 for r in rows if r.get("label"))
+            self._send(200, json.dumps({"ok": True, "labeled": done}).encode())
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.ThreadingTCPServer((args.host, args.port), Handler) as srv:
+        done = sum(1 for r in rows if r.get("label"))
+        print(f"shrink label — {len(rows)} rows, {done} already labeled")
+        print(f"  http://{args.host}:{args.port}/")
+        print(f"  writing to {path}")
+        print("  keys: a t m e u · j/k or arrows to move · ? reveals the prediction")
+        print("  ctrl-c to stop")
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            print("\nstopped")
+    return 0
+
+
 def cmd_stub(name: str):
     def run(args) -> int:
         print(f"`shrink {name}` is not implemented yet.", file=sys.stderr)
@@ -510,6 +600,13 @@ def main(argv=None) -> int:
     e = sub.add_parser("eval", help="score the denoiser against hand labels")
     e.add_argument("--labels", default="eval/labels.jsonl")
     e.set_defaults(func=cmd_eval)
+
+    lb = sub.add_parser("label", help="serve a local labeling UI over the eval set")
+    lb.add_argument("--labels", default="eval/labels.jsonl")
+    lb.add_argument("--port", type=int, default=7331)
+    lb.add_argument("--host", default="127.0.0.1",
+                    help="loopback by default; the rows contain your own prompts")
+    lb.set_defaults(func=cmd_label)
 
     for name, helptext in (("excerpt", "fetch context around a turn id [M3]"),
                            ("verify", "check a quote against source [M3]"),

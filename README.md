@@ -76,3 +76,18 @@ $EDITOR eval/labels.jsonl       # set "label" on each row
 ```
 
 MIT.
+
+### Labeling
+
+```sh
+./bin/shrink label                    # loopback, http://127.0.0.1:7331
+./bin/shrink label --host 0.0.0.0     # reachable over LAN/VPN
+```
+
+Keys: `a` `t` `m` `e` `u` to label, `j`/`k` or arrows to move, `?` reveals what
+the rule guessed. Every choice writes through to `eval/labels.jsonl`
+immediately — close the tab whenever.
+
+The prediction is hidden by default on purpose. Seeing it first anchors the
+labeler to the rule being tested, which is how a denoiser eval quietly grades
+itself.

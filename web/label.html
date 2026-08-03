@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>shrink — label</title>
+<style>
+  :root {
+    --bg:#faf9f7; --fg:#1c1a17; --dim:#6b655e; --line:#e3ded5; --card:#fff;
+    --accent:#7a5c3e; --warn:#8a5a2b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14130f; --fg:#e8e4dc; --dim:#8d8878; --line:#2c2a24; --card:#1c1a16;
+            --accent:#c99b6a; --warn:#d0a05c; }
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:15px/1.5 ui-sans-serif,-apple-system,system-ui,sans-serif;
+    -webkit-text-size-adjust:100%;
+  }
+  header {
+    position:sticky; top:0; background:var(--bg); border-bottom:1px solid var(--line);
+    padding:.7rem 1rem calc(.7rem); display:flex; gap:.75rem; align-items:baseline;
+    flex-wrap:wrap; padding-top:max(.7rem, env(safe-area-inset-top));
+  }
+  h1 { font-size:.95rem; margin:0; font-weight:600; letter-spacing:.02em; }
+  .count { color:var(--dim); font-size:.85rem; font-variant-numeric:tabular-nums; }
+  .bar { flex:1 1 100%; height:3px; background:var(--line); border-radius:2px; overflow:hidden; }
+  .bar > i { display:block; height:100%; background:var(--accent); transition:width .2s; }
+  main { padding:1rem; max-width:52rem; margin:0 auto; }
+  .meta { display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom:.6rem; }
+  .tag {
+    font-size:.72rem; letter-spacing:.04em; text-transform:uppercase;
+    border:1px solid var(--line); border-radius:999px; padding:.15rem .6rem; color:var(--dim);
+  }
+  .tag.b { border-color:var(--accent); color:var(--accent); }
+  pre {
+    background:var(--card); border:1px solid var(--line); border-radius:8px;
+    padding:.9rem; margin:0 0 1rem; white-space:pre-wrap; word-break:break-word;
+    font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;
+    max-height:46vh; overflow:auto;
+  }
+  pre:empty::before { content:"(empty after stripping)"; color:var(--dim); font-style:italic; }
+  .keys { display:grid; grid-template-columns:repeat(auto-fit,minmax(9rem,1fr)); gap:.5rem; }
+  button {
+    font:inherit; padding:.75rem .5rem; border-radius:8px; cursor:pointer;
+    background:var(--card); color:var(--fg); border:1px solid var(--line);
+    display:flex; align-items:center; justify-content:center; gap:.45rem;
+  }
+  button:hover { border-color:var(--accent); }
+  button.on { background:var(--accent); border-color:var(--accent); color:var(--bg); }
+  button kbd {
+    font:11px ui-monospace,monospace; border:1px solid currentColor; border-radius:3px;
+    padding:0 .3rem; opacity:.55;
+  }
+  .nav { display:flex; gap:.5rem; margin-top:1rem; align-items:center; }
+  .nav button { flex:0 0 auto; padding:.5rem .9rem; }
+  .spacer { flex:1; }
+  .peek {
+    margin-top:1rem; font-size:.85rem; color:var(--dim);
+    border-top:1px dashed var(--line); padding-top:.7rem;
+  }
+  .peek b { color:var(--warn); font-weight:600; }
+  a.link { color:var(--dim); font-size:.8rem; text-decoration:none; border-bottom:1px dotted; cursor:pointer; }
+  .done { text-align:center; padding:3rem 1rem; color:var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>shrink · label</h1>
+  <span class="count" id="count"></span>
+  <span class="spacer"></span>
+  <a class="link" id="jump">next unlabeled</a>
+  <div class="bar"><i id="prog"></i></div>
+</header>
+
+<main id="app"></main>
+
+<script>
+const KINDS = [
+  ["authored",     "a", "the human typed this"],
+  ["tool_result",  "t", "machine output fed back"],
+  ["meta",         "m", "injected / system bookkeeping"],
+  ["empty",        "e", "nothing left after stripping"],
+  ["unrecognized", "u", "malformed or unknown shape"],
+];
+let rows = [], i = 0, peek = false;
+
+const el = document.getElementById("app");
+
+async function load() {
+  rows = await (await fetch("/api/rows")).json();
+  i = Math.max(0, rows.findIndex(r => !r.label));
+  if (i < 0) i = 0;
+  render();
+}
+
+function labeledCount() { return rows.filter(r => r.label).length; }
+
+function render() {
+  const n = labeledCount();
+  document.getElementById("count").textContent = `${n} / ${rows.length} labeled`;
+  document.getElementById("prog").style.width = (100 * n / rows.length) + "%";
+
+  if (!rows.length) { el.innerHTML = '<p class="done">No rows.</p>'; return; }
+  const r = rows[i];
+
+  el.innerHTML = `
+    <div class="meta">
+      <span class="tag b">${r.bucket}</span>
+      <span class="tag">${i + 1} of ${rows.length}</span>
+      <span class="tag">${r.raw_len.toLocaleString()} chars raw</span>
+      ${r.label ? `<span class="tag b">labeled: ${r.label}</span>` : ""}
+    </div>
+    <pre>${escapeHtml(r.excerpt)}</pre>
+    <div class="keys">
+      ${KINDS.map(([k, key, desc]) => `
+        <button data-k="${k}" class="${r.label === k ? "on" : ""}" title="${desc}">
+          ${k}<kbd>${key}</kbd>
+        </button>`).join("")}
+    </div>
+    <div class="nav">
+      <button data-nav="-1">← prev</button>
+      <button data-nav="1">next →</button>
+      <span class="spacer"></span>
+      <a class="link" id="peekToggle">${peek ? "hide" : "show"} what the rule guessed</a>
+    </div>
+    ${peek ? `<div class="peek">predicted <b>${r.predicted}</b> · reason <b>${r.reason}</b></div>` : ""}
+  `;
+
+  el.querySelectorAll("[data-k]").forEach(b =>
+    b.onclick = () => setLabel(b.dataset.k));
+  el.querySelectorAll("[data-nav]").forEach(b =>
+    b.onclick = () => go(i + (+b.dataset.nav)));
+  document.getElementById("peekToggle").onclick = () => { peek = !peek; render(); };
+}
+
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
+}
+
+function go(n) {
+  if (n < 0 || n >= rows.length) return;
+  i = n; render();
+  window.scrollTo({ top: 0 });
+}
+
+async function setLabel(k) {
+  const r = rows[i];
+  r.label = r.label === k ? null : k;
+  render();
+  await fetch("/api/label", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ turn_id: r.turn_id, label: r.label }),
+  });
+  if (r.label && i < rows.length - 1) setTimeout(() => go(i + 1), 90);
+}
+
+document.getElementById("jump").onclick = () => {
+  const n = rows.findIndex(r => !r.label);
+  if (n >= 0) go(n);
+};
+
+addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const hit = KINDS.find(([, key]) => key === e.key.toLowerCase());
+  if (hit) { e.preventDefault(); setLabel(hit[0]); return; }
+  if (e.key === "ArrowRight" || e.key === "j") { e.preventDefault(); go(i + 1); }
+  if (e.key === "ArrowLeft"  || e.key === "k") { e.preventDefault(); go(i - 1); }
+  if (e.key === "?") { peek = !peek; render(); }
+});
+
+load();
+</script>
+</body>
+</html>
