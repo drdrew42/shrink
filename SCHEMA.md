@@ -92,15 +92,28 @@ authored  ⟺  type == "user"
           ∧  text is non-empty after wrapper stripping
 ```
 
-Measured on 9,723 user records:
+Measured on 9,748 user records:
 
 | kind | n | share |
 |---|---|---|
-| tool_result | 8,401 | 86.4% |
-| authored | 1,083 | 11.1% |
-| empty (wrappers only) | 132 | 1.4% |
-| meta | 104 | 1.1% |
+| tool_result | 8,424 | 86.4% |
+| authored | 926 | 9.5% |
+| meta | 395 | 4.1% |
 | unrecognized | 3 | 0.0% |
+
+> **Probe #4 resolved — and it mattered.** The wrapper-tag list was
+> observational and incomplete. Scanning every non-tool user record for tags in
+> *opening* position (the position that decides authorship) found two missing:
+> `<task-notification>` (159 records) and `<local-command-caveat>` (49).
+>
+> Both were being scored as human speech. Correcting the list moved authored
+> from 11.1% to 9.5% of records — and from **1,189,984 to 277,825 characters, a
+> 77% cut**, because task notifications are long. Every byte-weighted statistic
+> in the dry tier would have been dominated by machine text.
+>
+> The lesson generalizes: enumerate injected tags empirically per build, do not
+> inherit a list. Re-run the opening-position scan whenever the corpus spans a
+> new build.
 
 **`userType` and `isSidechain` are inert on top-level session files.** `userType`
 is present on all 9,716 records and always `"external"`; `isSidechain` is always
@@ -127,12 +140,22 @@ handles a dangling open tag to end-of-string.
 ### Pastes
 
 Flagged, not dropped: `len >= 1500 ∧ lines >= 20 ∧ mean line < 120 chars`.
-43 of 1,007 turns flagged. `[measured]` The eval set adjudicates whether the
-threshold is right — a hand-labeled corpus is the arbiter, not the heuristic.
+5 of 857 turns flagged. `[measured]`
 
-Median authored turn is 236 chars against a mean of 1,181. The distribution is
-severely right-skewed, which is exactly why paste handling matters and why any
-statistic over turn length must be a median.
+**The heuristic only catches code-shaped pastes.** It keys on short lines, so a
+pasted *prose* document — a research report, an email thread, someone else's
+feedback — sails through. The longest authored turn in the reference corpus is
+21,480 chars: a two-line human preamble followed by a pasted research report,
+flagged `paste=False`.
+
+That is a real gap, and it is **not** a classification problem. Authored-vs-not
+is a decision about the *record*; a record can be genuinely authored and still
+be 95% someone else's bytes. Paste extraction is a within-record problem, owed
+at M2 before any byte-weighted statistic is trusted.
+
+Distribution: n=857, median 185, mean 324, p95 866, max 21,480. Severely
+right-skewed even after the tag fix — every statistic over turn length must be
+a median, and vocabulary measures must be paste-trimmed first.
 
 ---
 

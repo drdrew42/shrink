@@ -43,18 +43,31 @@ EXCLUDED_SUBDIRS = {"subagents", "tool-results"}
 
 # Blocks injected into authored turns. Stripped, never used to discard a turn:
 # a reminder appended to something you typed does not make it not-yours.
-WRAPPER_RE = re.compile(
-    r"<(system-reminder|command-name|command-message|command-args|"
-    r"command-contents|local-command-stdout|local-command-stderr)>"
-    r".*?</\1>|<\1\s*/>",
-    re.DOTALL,
+#
+# Enumerated by scanning every non-tool user record on the reference corpus for
+# tags in opening position — the position that decides authorship. Probe #4.
+# task-notification (159 records) and local-command-caveat (49) were both
+# missing from the original observational list and were being scored as human
+# speech; task-notification alone was 18% of the first eval sample.
+INJECTED_TAGS = (
+    "system-reminder",
+    "task-notification",
+    "command-name",
+    "command-message",
+    "command-args",
+    "command-contents",
+    "local-command-caveat",
+    "local-command-stdout",
+    "local-command-stderr",
 )
+_TAGS = "|".join(INJECTED_TAGS)
+
+WRAPPER_RE = re.compile(rf"<({_TAGS})>.*?</\1>|<({_TAGS})\s*/>", re.DOTALL)
 # Unclosed variants show up when output was truncated mid-write.
-DANGLING_RE = re.compile(
-    r"<(system-reminder|command-name|command-message|command-args|"
-    r"command-contents|local-command-stdout|local-command-stderr)>.*\Z",
-    re.DOTALL,
-)
+DANGLING_RE = re.compile(rf"<({_TAGS})>.*\Z", re.DOTALL)
+# Opening-position match: a record that *starts* with an injected block was
+# delivered by the harness, not typed.
+LEADING_RE = re.compile(rf"\s*<({_TAGS})>")
 
 
 # --------------------------------------------------------------------------
@@ -138,6 +151,35 @@ def extract_text(content) -> tuple[str | None, str]:
     return None, "unrecognized_content"
 
 
+def preview(rec: dict) -> str:
+    """Something showable for a record with no authored text.
+
+    A blank card is unlabelable — the human has to see what the record actually
+    was in order to judge whether the classifier got it right.
+    """
+    content = rec.get("message", {}).get("content")
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_result":
+                body = b.get("content")
+                if isinstance(body, list):
+                    body = " ".join(
+                        x.get("text", "") for x in body if isinstance(x, dict))
+                out.append(f"[tool_result] {str(body)[:700]}")
+            else:
+                out.append(f"[{b.get('type')}] {json.dumps(b)[:300]}")
+        if out:
+            return "\n".join(out)
+    tur = rec.get("toolUseResult")
+    if tur is not None:
+        return f"[toolUseResult] {json.dumps(tur)[:700]}"
+    return "[no content] " + json.dumps(
+        {k: v for k, v in rec.items() if k not in ("message",)})[:500]
+
+
 def classify(rec: dict) -> tuple[str, str]:
     """(kind, reason) for a type:"user" record.
 
@@ -156,7 +198,12 @@ def classify(rec: dict) -> tuple[str, str]:
     if rec.get("isMeta"):
         return "meta", "isMeta"
     if not strip_wrappers(text):
-        return "empty", "wrappers_only"
+        # Wholly injected: a task notification, a slash-command echo, a caveat.
+        # Machine-delivered, so meta — "empty" is reserved for records that were
+        # genuinely blank to begin with.
+        if LEADING_RE.match(text):
+            return "meta", "injected_only"
+        return "empty", "no_content"
     return "authored", reason
 
 
@@ -423,18 +470,33 @@ def cmd_sample(args) -> int:
                 bucket = "authored_wrapped"
             if kind == "authored" and looks_pasted(stripped):
                 bucket = "authored_paste_flagged"
+            shown = stripped or raw or preview(rec)
             buckets[bucket].append({
                 "turn_id": f"{session_id}:{rec.get('uuid') or line_no}",
                 "predicted": kind,
                 "reason": reason,
                 "label": None,
-                "excerpt": stripped[:600] if stripped else raw[:600],
+                "excerpt": shown[:900],
                 "raw_len": len(raw),
             })
 
-    per = max(1, args.n // max(1, len(buckets)))
+    # Precision is TP/(TP+FP) over *predicted-authored* rows, so half the budget
+    # goes there. An even split across buckets spends most of the labeling
+    # effort confirming obvious tool results and leaves the number that actually
+    # gates M1 resting on a few dozen rows.
+    authored_buckets = {b for b in buckets if b.startswith("authored")}
+    other = set(buckets) - authored_buckets
+    budget = {}
+    if authored_buckets:
+        share = (args.n // 2) // len(authored_buckets)
+        budget.update({b: max(1, share) for b in authored_buckets})
+    if other:
+        share = (args.n - sum(budget.values())) // len(other)
+        budget.update({b: max(1, share) for b in other})
+
     out: list[dict] = []
     for bucket, items in sorted(buckets.items()):
+        per = budget.get(bucket, 1)
         step = max(1, len(items) // per)
         picked = items[::step][:per]
         for row in picked:
