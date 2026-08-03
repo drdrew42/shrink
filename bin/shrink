@@ -1565,7 +1565,15 @@ def cmd_doctor(args) -> int:
                if k.startswith("type:") and k[5:] not in KNOWN_TYPES}
     hist = read_history()
 
+    manifest = PLUGIN_ROOT / ".claude-plugin" / "plugin.json"
+    version = "unknown (running from source?)"
+    try:
+        version = json.loads(manifest.read_text()).get("version", version)
+    except (OSError, ValueError):
+        pass
+
     report = {
+        "shrink_version": version,
         "shrink_summary_version": SUMMARY_VERSION,
         "platform": platform.system(),
         "python": platform.python_version(),
