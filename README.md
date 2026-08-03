@@ -62,9 +62,31 @@ why a corpus that looks enormous is actually small enough to reason about whole.
 
 ## Install
 
-Not yet. When it ships it will be a plugin marketplace entry, installed from
-this repo directly — it will not be listed in the Anthropic software directory,
-because directory policy §1.F bars listed software from reading chat history.
+```
+/plugin marketplace add drdrew42/shrink
+/plugin install shrink
+```
+
+That is the whole thing — a Claude Code "marketplace" is just a git repo with a
+`.claude-plugin/marketplace.json` in it. No review queue, no listing.
+
+`shrink` is deliberately **not** in the Anthropic software directory: directory
+policy §1.F bars listed software from reading chat history, with no exception
+for reading your own. Installing from this repo is unaffected.
+
+You will be asked once to allow `Bash(shrink:*)`. Everything the plugin does
+goes through that one command, so it is one prompt rather than a storm.
+
+## Before you run it
+
+```
+shrink doctor
+```
+
+Reports whether your corpus is big enough, how many projects you have, which
+Claude Code builds wrote your sessions, and whether anything on disk looks
+unfamiliar to the parser. **Counts and versions only — no text you wrote.** If
+something goes wrong, that output is safe to paste into an issue.
 
 ## Layout
 

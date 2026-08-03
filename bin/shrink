@@ -1529,6 +1529,115 @@ def cmd_verify(args) -> int:
     return 0 if bad == 0 and missing == 0 else 1
 
 
+def cmd_doctor(args) -> int:
+    """Will this work on your machine, and what is different about it?
+
+    Everything in this tool was validated against exactly one corpus, on one
+    OS, with one project directory. This reports the shape of *your* install so
+    a failure can be diagnosed without anyone sending a single word they wrote.
+    Counts and versions only -- no prompt text, ever.
+    """
+    import platform
+    files = session_files()
+    stats: Counter = Counter()
+    turns = 0
+    builds: Counter = Counter()
+    projects: Counter = Counter()
+    for f in files:
+        t, st, _ = read_session(f)
+        stats.update(st)
+        turns += len(t)
+        projects[project_label(f)] += len(t)
+        for x in t:
+            if x.build:
+                builds[x.build] += 1
+
+    # Depth varies by build: <project>/<session>/subagents/agent-*.jsonl on
+    # current layouts, <project>/agent-*.jsonl on older ones. rglob covers both
+    # without guessing; a fixed-depth glob silently reported "none found" on a
+    # machine holding 177 of them.
+    all_agent = list(PROJECTS_DIR.rglob("agent-*.jsonl")) if PROJECTS_DIR.is_dir() else []
+    flat_agents = [f for f in all_agent if f.parent.parent == PROJECTS_DIR]
+    nested = [f for f in all_agent if f not in set(flat_agents)]
+    unknown = {k[5:]: v for k, v in stats.items()
+               if k.startswith("type:") and k[5:] not in KNOWN_TYPES}
+    hist = read_history()
+
+    report = {
+        "shrink_summary_version": SUMMARY_VERSION,
+        "platform": platform.system(),
+        "python": platform.python_version(),
+        "claude_home_exists": CLAUDE_HOME.is_dir(),
+        "sessions": len(files),
+        "projects": len(projects),
+        "projects_over_20_turns": sum(1 for v in projects.values() if v >= 20),
+        "authored_turns": turns,
+        "authored_chars": None,
+        "history_prompts": len(hist),
+        "history_span_days": None,
+        "builds_seen": dict(builds.most_common(8)),
+        "subagent_layout": ("nested" if nested else
+                            "flat" if flat_agents else "none found"),
+        "nested_agent_files": len(nested),
+        "flat_agent_files": len(flat_agents),
+        "unknown_record_types": unknown,
+        "unparseable_lines": stats.get("unparseable_lines", 0),
+        "compact_boundaries": stats.get("compact_boundaries", 0),
+        "orphan_roots": stats.get("orphan_roots", 0),
+        "user_record_kinds": {k[5:]: v for k, v in stats.items()
+                              if k.startswith("user:")},
+    }
+    if hist:
+        ts = [h["ts"] for h in hist if h.get("ts")]
+        if ts:
+            report["history_span_days"] = round(
+                (max(ts) - min(ts)) / (1000 if max(ts) > 1e11 else 1) / 86400)
+
+    verdict = []
+    if not files:
+        verdict.append("NO SESSIONS FOUND — is CLAUDE_CONFIG_DIR set unusually?")
+    elif turns < 50:
+        verdict.append(f"Only {turns} authored turns. The panel needs more; "
+                       f"come back after a few weeks of use.")
+    else:
+        verdict.append(f"{turns} authored turns across {len(files)} sessions — "
+                       f"enough to run.")
+    if report["projects_over_20_turns"] < 2:
+        verdict.append("Only one project has enough turns — the cross-project "
+                       "lens will report that rather than compare.")
+    else:
+        verdict.append(f"{report['projects_over_20_turns']} projects with enough "
+                       f"turns — cross-project comparison available.")
+    if unknown:
+        verdict.append(f"{len(unknown)} unknown record type(s): "
+                       f"{', '.join(unknown)}. Not dropped, but the schema has "
+                       f"moved since this was written.")
+    if flat_agents:
+        verdict.append("Flat subagent layout detected (older build).")
+    if not hist:
+        verdict.append("No history.jsonl — the long-baseline tier will be empty.")
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print("shrink doctor")
+        print()
+        for k, v in report.items():
+            if isinstance(v, dict):
+                print(f"  {k}:")
+                for kk, vv in v.items():
+                    print(f"      {kk}: {vv}")
+            else:
+                print(f"  {k}: {v}")
+        print()
+        for line in verdict:
+            print(f"  • {line}")
+        print()
+        print("  This output contains counts and versions only — no text you "
+              "wrote.\n  Safe to share when reporting a problem.")
+    return 0
+
+
 def cmd_audit(args) -> int:
     """Scan a rendered report for identifiers that should not have survived.
 
@@ -1896,6 +2005,10 @@ def main(argv=None) -> int:
     vf.add_argument("--file", help="jsonl of {turn_id, quote}")
     vf.add_argument("--verbose", action="store_true")
     vf.set_defaults(func=cmd_verify)
+
+    dr = sub.add_parser("doctor", help="report this machine's corpus shape; safe to share")
+    dr.add_argument("--json", action="store_true")
+    dr.set_defaults(func=cmd_doctor)
 
     ad = sub.add_parser("audit", help="scan a rendered report for leaked identifiers")
     ad.add_argument("report")
