@@ -578,6 +578,59 @@ def jaccard(a: str, b: str) -> float:
     return len(sa & sb) / len(sa | sb)
 
 
+PRAISE = ("nice", "great", "excellent", "perfect", "beautiful", "love",
+          "awesome", "brilliant", "good", "yes", "wonderful", "well done",
+          "nice work", "spot on", "exactly")
+
+
+def affect_valence(texts: list[str]) -> dict:
+    """Where the charged language lands: on praise, on repair, or on neither.
+
+    A raw profanity rate says how often someone swears. It cannot say whether
+    they swear *at* the machine or *about* how well things are going, and those
+    are opposite findings. This was hand-fed to a theorist in the first run,
+    which does not generalise to anyone else's corpus — so it is measured here
+    and travels in the packet for every user.
+    """
+    out = {"praise": 0, "repair": 0, "neither": 0, "total": 0}
+    for t in texts:
+        if phrase_rate(t, PROFANITY) == 0:
+            continue
+        out["total"] += 1
+        praise = phrase_rate(t, PRAISE) > 0
+        repair = phrase_rate(t, REPAIR) > 0
+        if praise and not repair:
+            out["praise"] += 1
+        elif repair and not praise:
+            out["repair"] += 1
+        else:
+            out["neither"] += 1
+    return out
+
+
+def politeness_context(turns: list) -> dict:
+    """Does politeness cluster after a long gap, a short reply, an interrupt?
+
+    Same reasoning: a politeness *rate* is inert. Politeness that spikes right
+    after the machine has cost someone face is a finding, and it should be
+    measured rather than noticed by hand.
+    """
+    hi, lo = [], []
+    for t in turns:
+        txt = t.typed or ""
+        if not txt.strip():
+            continue
+        (hi if phrase_rate(txt, POLITENESS) > 0 else lo).append(t)
+    return {
+        "polite_turns": len(hi),
+        "plain_turns": len(lo),
+        "median_chars_when_polite": int(statistics.median(
+            [len(t.typed) for t in hi])) if hi else 0,
+        "median_chars_when_plain": int(statistics.median(
+            [len(t.typed) for t in lo])) if lo else 0,
+    }
+
+
 def turn_features(turns: list) -> list[dict]:
     """Per-turn feature vector. Ordered input; gaps are within-session only."""
     hours = Counter()
@@ -1527,6 +1580,8 @@ def cmd_packet(args) -> int:
                      "responses or outcomes."),
         },
         "statistics": measure(typed),
+        "affect_valence": affect_valence(typed),
+        "politeness_context": politeness_context(corpus.turns),
         "interrupts": len([e for e in corpus.events if e["kind"] == "interrupt"]),
         "outliers": [pack(r, r["why"]) for r in outliers],
         "controls": [pack(r) for r in controls],
@@ -1547,6 +1602,35 @@ def cmd_packet(args) -> int:
     return 0
 
 
+def _emit_evidence(out, c, source_text, for_display, records, limit):
+    """Show the evidence, not its id. A reader cannot resolve a uuid, and a
+    claim whose support is invisible reads as assertion."""
+    shown = 0
+    for tid in c["evidence"]:
+        body = source_text(tid)
+        if not body:
+            continue
+        one = " ".join(body.split())
+        if c.get("quote"):
+            flat = " ".join(c["quote"].split())
+            idx = one.find(flat)
+            if idx >= 0:
+                one = one[max(0, idx - 60):idx + len(flat) + 90]
+        if len(one) > 260:
+            one = one[:260].rsplit(" ", 1)[0] + "…"
+        when = ""
+        rec = records.get(tid)
+        if rec and rec.get("timestamp"):
+            h = local_hour(rec["timestamp"])
+            when = h.strftime("%a %H:%M ") if h else ""
+        out.append(f"> {when}— {for_display(one)}\n")
+        shown += 1
+        if shown >= limit:
+            break
+    if not shown:
+        out.append("> *(cited turns no longer on disk)*\n")
+
+
 def cmd_render(args) -> int:
     """Deterministic report assembly. A script with a template, not a model.
 
@@ -1558,9 +1642,26 @@ def cmd_render(args) -> int:
     bar = build_barrier()
 
     kept, dropped = [], []
-    all_ids = {c["turn_id"] for f in findings for c in f.get("claims", [])
-               for c in [{"turn_id": t} for t in c.get("evidence", [])]}
+    all_ids = {t for f in findings for c in f.get("claims", [])
+               for t in c.get("evidence", [])}
     records = find_records(all_ids)
+
+    def source_text(tid: str) -> str:
+        rec = records.get(tid)
+        if rec is None:
+            return ""
+        text, _ = extract_text(rec.get("message", {}).get("content"))
+        return strip_wrappers(text or "")
+
+    def for_display(text: str) -> str:
+        """Verify happens upstream; this is the redact step, and it runs last.
+
+        Paths, emails, keys and IPs are masked because they are never useful to
+        the reader and always dangerous in a screenshot. Repo names are restored
+        because the report is for the person who owns them — unless --share.
+        """
+        red = bar.apply(text)
+        return red if args.share else bar.rehydrate(red)
 
     for f in findings:
         good = []
@@ -1604,13 +1705,55 @@ def cmd_render(args) -> int:
     out.append(f"- you interrupted **{packet['interrupts']}** times\n")
     out.append(f"> {cov['note']}\n")
 
-    for f in kept:
+    # Synthesis, when present, replaces theorist-grouped output with a single
+    # ordered read. Three parallel readers cannot give a report a spine; this is
+    # the stage that does, without adding claims or deleting any.
+    syn = json.loads(Path(args.synthesis).read_text()) if args.synthesis else None
+    if syn:
+        by = {f["theorist"]: f["claims"] for f in kept}
+        out.append("## The read\n")
+        out.append(syn.get("opening", "").strip() + "\n")
+        seen = set()
+        for step in syn.get("order", []):
+            claims = by.get(step.get("theorist")) or []
+            i = step.get("index", -1)
+            if not (0 <= i < len(claims)):
+                continue
+            key = (step["theorist"], i)
+            if key in seen:
+                continue
+            seen.add(key)
+            c = claims[i]
+            if step.get("bridge"):
+                out.append(f"*{step['bridge'].strip()}*\n")
+            out.append(f"{c['claim']}\n")
+            _emit_evidence(out, c, source_text, for_display, records,
+                           args.quotes_per_claim)
+            out.append(f"<sub>— {step['theorist']}</sub>\n")
+        # Anything the synthesist forgot still gets printed. Silent loss is
+        # worse than an untidy tail.
+        for f in kept:
+            for i, c in enumerate(f["claims"]):
+                if (f["theorist"], i) in seen:
+                    continue
+                out.append(f"{c['claim']}\n")
+                _emit_evidence(out, c, source_text, for_display, records,
+                               args.quotes_per_claim)
+                out.append(f"<sub>— {f['theorist']}</sub>\n")
+        if syn.get("tensions"):
+            out.append("## Where they disagree\n")
+            for t in syn["tensions"]:
+                out.append(f"- {t}")
+            out.append("")
+
+    for f in ([] if syn else kept):
         out.append(f"## {f.get('theorist', 'panel').title()}\n")
         for c in f["claims"]:
             out.append(f"{c['claim']}\n")
-            if c.get("quote"):
-                out.append(f"> {bar.rehydrate(c['quote'])}\n")
-            out.append(f"<sub>{', '.join(c['evidence'][:4])}</sub>\n")
+            # Show the evidence, not its id. A reader cannot resolve a uuid, and
+            # a claim whose support is invisible reads as assertion.
+            _emit_evidence(out, c, source_text, for_display, records,
+                           args.quotes_per_claim)
 
     if dropped:
         out.append("## Dropped\n")
@@ -1702,6 +1845,10 @@ def main(argv=None) -> int:
     rn.add_argument("--packet", default="packet.json")
     rn.add_argument("--findings", required=True, help="jsonl, one object per theorist")
     rn.add_argument("--out")
+    rn.add_argument("--quotes-per-claim", type=int, default=2)
+    rn.add_argument("--synthesis", help="synthesist output; gives the report a spine")
+    rn.add_argument("--share", action="store_true",
+                    help="keep pseudonyms instead of restoring real names")
     rn.set_defaults(func=cmd_render)
 
     args = p.parse_args(argv)

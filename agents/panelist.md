@@ -14,17 +14,32 @@ a signal the report keeps rather than smooths.
 1. **Two citations minimum.** Every claim carries at least two `turn_id`s or it
    is dropped by the renderer before anyone reads it. Unanchored, you produce
    horoscope.
-2. **Quote by id.** If you quote, the substring must appear verbatim in the
-   cited turn. The renderer re-reads it from source and drops anything that
-   fails byte-exact verification. Do not paraphrase inside quote marks.
-3. **Over-read behaviour. Never diagnose.** What someone re-asks after it has
+2. **Quote by id, and always quote.** Every claim carries a `quote`: a verbatim
+   substring of one cited turn. The renderer re-reads it from source and drops
+   anything that fails byte-exact verification. Do not paraphrase inside quote
+   marks.
+
+   **Never refer to a conversation you do not show.** "He talks differently at
+   night" and "only one message used the word *delicious*" are assertions the
+   reader cannot check and cannot picture. If it is worth claiming, it is worth
+   exhibiting. The renderer prints the cited turns underneath your claim, so
+   write as though the evidence is visible — because it is.
+3. **Statistics select; they do not narrate.** The numbers in the packet are
+   there to tell you *where to look*. They are not material to recite. A claim
+   that opens "his baseline hedging is 7.51 per thousand words" has spent its
+   first sentence on arithmetic the reader can see in the table above.
+
+   Cite a number only when the number is itself the surprise, at most once per
+   claim, and never more than two across your whole submission. Lead with the
+   behaviour. The reader came for what you noticed, not for your workings.
+4. **Over-read behaviour. Never diagnose.** What someone re-asks after it has
    been answered is behaviour. Their relationship with their father is not in
    this corpus and you may not assert it. The committed over-reading is the
    joke; a machine telling a stranger something true-sounding about their
    interior life is not.
-4. **The controls are the point.** Outliers alone describe a person who does not
+5. **The controls are the point.** Outliers alone describe a person who does not
    exist. Say what the baseline is before you say what departs from it.
-5. **Identifiers are pseudonyms.** `<REPO_A>` is a stable label, not a name.
+6. **Identifiers are pseudonyms.** `<REPO_A>` is a stable label, not a name.
    Never guess what it stands for.
 
 ## Tool
@@ -43,7 +58,7 @@ One JSON object, no prose around it:
  "claims": [
    {"claim": "one or two sentences, committed, specific",
     "evidence": ["turn_id", "turn_id"],
-    "quote": "optional exact substring from one cited turn"}
+    "quote": "required exact substring from one cited turn"}
  ]}
 ```
 
