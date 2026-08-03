@@ -299,6 +299,19 @@ Order is **verify → redact → render**. Verification anchors to the
 pre-redaction string; redacting first makes byte-exact verification
 unsatisfiable.
 
+Implemented and verified end to end:
+
+```
+before: /Users/me/github/proj, mail a@b.com, host 10.10.20.10,
+        token sk-ant-api03-…, https://host.example/health
+after : <PATH>, mail <EMAIL>, host <IP>, token <KEY>, <URL>/health
+```
+
+Note `project_label()` is lossy — it cannot invert a mangled directory name
+containing literal `-` or `~`, so the seeded alias will not always match a real
+path verbatim. The regex classes catch it anyway; that redundancy is the point,
+not an accident.
+
 Exact on structured fields (paths, hostnames, emails, key-shaped strings, known
 project names). Best-effort on prose — "the dainamiq linker" typed mid-sentence
 is caught by a proper-noun pass seeded with known repo names, and "most" is the

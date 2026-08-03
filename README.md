@@ -7,9 +7,17 @@ over-read it on purpose.
 Everything runs locally. Model calls use your own tokens. Nothing leaves the
 machine.
 
-**Status: pre-release.** M1 closed — extractor and denoiser at
-**1.000 precision / 1.000 recall** on a 60-row held-out sample (182 turns
-hand-labeled in total). The panel does not exist yet.
+**Status: pre-release.** M1–M3 done. The denoiser scores **1.000 precision /
+1.000 recall** on a 60-row held-out sample (182 turns hand-labeled). The dry
+tier, `excerpt`, `verify` and the identifier barrier all work. The panel does
+not exist yet.
+
+```sh
+shrink dry --days 30          # the sincere tier, offline
+shrink excerpt <turn-id>      # context around a turn, segment-aware
+shrink verify --file q.jsonl  # quotes, byte-exact or dropped
+shrink purge                  # wipe reports, metrics, cache
+```
 
 ## Try it
 
