@@ -1109,6 +1109,9 @@ class Barrier:
         for real in sorted(self.alias, key=len, reverse=True):
             if real and real in out:
                 out = out.replace(real, self.alias[real])
+        # Mail is often already inside angle brackets in a pasted header;
+        # replacing naively yields "<<EMAIL>>".
+        out = re.sub(r"<\s*" + EMAIL_RE.pattern + r"\s*>", "<EMAIL>", out)
         out = EMAIL_RE.sub("<EMAIL>", out)
         out = KEYISH_RE.sub("<KEY>", out)
         out = URL_RE.sub("<URL>", out)
@@ -1615,7 +1618,14 @@ def _emit_evidence(out, c, source_text, for_display, records, limit):
             flat = " ".join(c["quote"].split())
             idx = one.find(flat)
             if idx >= 0:
-                one = one[max(0, idx - 60):idx + len(flat) + 90]
+                start = max(0, idx - 60)
+                if start:
+                    # Snap to a word boundary — a quote opening "e building for
+                    # FPGA" makes the reader work to recover the sentence, which
+                    # is the opposite of showing your evidence.
+                    nxt = one.find(" ", start)
+                    start = nxt + 1 if 0 <= nxt < idx else start
+                one = ("…" if start else "") + one[start:idx + len(flat) + 90]
         if len(one) > 260:
             one = one[:260].rsplit(" ", 1)[0] + "…"
         when = ""
