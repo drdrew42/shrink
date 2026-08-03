@@ -59,7 +59,12 @@ places, the sections should have been one section.
 
 ## Output
 
-One JSON object, no prose around it:
+You hold `Bash(shrink excerpt:*)` and nothing else — no file access, by design.
+The claims and packet arrive **in your prompt**; your report goes back as your
+**final message**, which is the return value. Do not try to read or write files.
+
+Your final message is one JSON object and nothing else — no prose around it, no
+markdown fence:
 
 ```json
 {"sections": [

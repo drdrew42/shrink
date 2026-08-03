@@ -40,17 +40,24 @@ Outliers plus a control set, identifiers pseudonymised on the way out.
 ## 4. The panel
 
 Run the `shrink:freud`, `shrink:jung`, and `shrink:goffman` agents **in
-parallel**, each with the same packet
-and no other context. Do not summarise the packet for them and do not hand any
-of them an observation the others lack — a finding that only exists because you
-primed one theorist will not reproduce on anyone else's corpus.
+parallel**. They hold `Bash(shrink excerpt:*)` and nothing else, so:
 
-Each writes findings JSON. Merge into one JSONL, one object per theorist.
+- **Paste the packet JSON into each prompt.** They cannot read files.
+- **Their findings come back as their final message.** They cannot write files —
+  you write the JSONL.
+
+Give all three the *same* packet and no other context. Do not summarise it for
+them and do not hand any of them an observation the others lack — a finding that
+only exists because one theorist was primed will not reproduce on anyone else's
+corpus.
+
+Merge the three returned objects into one JSONL, one object per line.
 
 ## 5. The report
 
-Run the `shrink:analyst` agent over the theorists' claims plus the packet. It writes the report:
-one voice, second person, merged sections.
+Run the `shrink:analyst` agent, pasting in the theorists' claims and the packet.
+Its report comes back as its final message; you write it to a file. One voice,
+second person, merged sections.
 
 ```
 shrink render --packet packet.json --findings findings.jsonl \

@@ -51,7 +51,13 @@ different finding than a politeness drop out of nowhere.
 
 ## Output
 
-One JSON object, no prose around it:
+You hold `Bash(shrink excerpt:*)` and nothing else — no file access, by design.
+The packet arrives **in your prompt**, and your findings go back as your **final
+message**, which is the return value. Do not try to read or write files; you
+cannot, and the attempt costs a turn.
+
+Your final message is one JSON object and nothing else — no prose around it, no
+markdown fence:
 
 ```json
 {"theorist": "<your name>",
