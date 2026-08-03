@@ -1529,6 +1529,48 @@ def cmd_verify(args) -> int:
     return 0 if bad == 0 and missing == 0 else 1
 
 
+def cmd_audit(args) -> int:
+    """Scan a rendered report for identifiers that should not have survived.
+
+    The report is the artifact people screenshot, and it carries verbatim
+    quotes of their own writing. Trusting the barrier is not the same as
+    checking it, and the check is cheap.
+    """
+    text = Path(args.report).read_text()
+    bar = build_barrier()
+    checks = [
+        ("absolute path", ABSPATH_RE),
+        ("email", EMAIL_RE),
+        ("url", URL_RE),
+        ("ip address", IP_RE),
+        ("key-shaped string", KEYISH_RE),
+    ]
+    findings = []
+    for label, rx in checks:
+        for m in rx.finditer(text):
+            findings.append((label, m.group(0)))
+    # Real project names, which the barrier is meant to alias.
+    for real in bar.alias:
+        if len(real) > 3 and real in text:
+            findings.append(("project name", real))
+
+    if not findings:
+        print(f"clean — no paths, emails, urls, ips, keys, or project names "
+              f"in {args.report}")
+        return 0
+    by = Counter(label for label, _ in findings)
+    print(f"{len(findings)} identifier(s) present in {args.report}:")
+    for label, count in by.most_common():
+        print(f"  {count:>4}  {label}")
+    for label, hit in findings[:12]:
+        print(f"    {label}: {hit[:90]}")
+    if not args.share_mode:
+        print("\nNote: a report rendered without --share intentionally restores "
+              "project names for its owner. Re-run render --share and audit that "
+              "to check what a shared copy would expose.")
+    return 1
+
+
 def cmd_purge(args) -> int:
     import shutil
     targets = [REPORT_HOME / "reports", REPORT_HOME / "metrics.jsonl",
@@ -1605,7 +1647,8 @@ def cmd_packet(args) -> int:
     return 0
 
 
-def _emit_evidence(out, c, source_text, for_display, records, limit):
+def _emit_evidence(out, c, source_text, for_display, records, limit,
+                   suppressed=0):
     """Show the evidence, not its id. A reader cannot resolve a uuid, and a
     claim whose support is invisible reads as assertion."""
     shown = 0
@@ -1638,7 +1681,13 @@ def _emit_evidence(out, c, source_text, for_display, records, limit):
         if shown >= limit:
             break
     if not shown:
-        out.append("> *(cited turns no longer on disk)*\n")
+        if suppressed:
+            out.append(f"> *(evidence for this section is quoted above)*\n")
+        elif c["evidence"]:
+            out.append("> *(cited turns are no longer on disk — sessions are "
+                       "swept at 30 days)*\n")
+        else:
+            out.append("> *(no evidence cited)*\n")
 
 
 def cmd_render(args) -> int:
@@ -1651,9 +1700,18 @@ def cmd_render(args) -> int:
     findings = [json.loads(l) for l in Path(args.findings).open() if l.strip()]
     bar = build_barrier()
 
+    ana = json.loads(Path(args.analysis).read_text()) if args.analysis else None
+
     kept, dropped = [], []
+    # The analyst may cite turns no theorist cited. Indexing only the theorists'
+    # ids left those unresolved, and the renderer then reported them as "no
+    # longer on disk" -- a false statement produced by a real mechanism, which
+    # is the exact failure this tool exists to avoid.
     all_ids = {t for f in findings for c in f.get("claims", [])
                for t in c.get("evidence", [])}
+    if ana:
+        all_ids |= {t for sec in ana.get("sections", [])
+                    for t in sec.get("evidence", [])}
     records = find_records(all_ids)
 
     def source_text(tid: str) -> str:
@@ -1718,7 +1776,6 @@ def cmd_render(args) -> int:
     # Analyst mode: one voice, merged sections, second person. The panel is the
     # reasoning; this is the report. Quotes are still placed by the renderer
     # from source, which is the only reason none of them can be fabricated.
-    ana = json.loads(Path(args.analysis).read_text()) if args.analysis else None
     seen_turns: set = set()
     if ana:
         for sec in ana.get("sections", []):
@@ -1728,7 +1785,8 @@ def cmd_render(args) -> int:
             seen_turns.update(ev)
             _emit_evidence(out, {"evidence": ev, "quote": None},
                            source_text, for_display, records,
-                           args.quotes_per_claim)
+                           args.quotes_per_claim,
+                           suppressed=len(sec.get("evidence", [])) - len(ev))
             if sec.get("lenses"):
                 out.append(f"<sub>{' · '.join(sec['lenses'])}</sub>\n")
         if ana.get("closing"):
@@ -1838,6 +1896,12 @@ def main(argv=None) -> int:
     vf.add_argument("--file", help="jsonl of {turn_id, quote}")
     vf.add_argument("--verbose", action="store_true")
     vf.set_defaults(func=cmd_verify)
+
+    ad = sub.add_parser("audit", help="scan a rendered report for leaked identifiers")
+    ad.add_argument("report")
+    ad.add_argument("--share-mode", action="store_true",
+                    help="the report was rendered with --share")
+    ad.set_defaults(func=cmd_audit)
 
     pg = sub.add_parser("purge", help="wipe reports, metrics series, and cache")
     pg.set_defaults(func=cmd_purge)
