@@ -111,8 +111,8 @@ def project_label(path: Path) -> str:
 class Turn:
     __slots__ = (
         "turn_id", "session_id", "uuid", "parent_uuid", "ts", "project",
-        "kind", "text", "raw_len", "segment", "line_no", "build",
-        "looks_pasted", "role",
+        "kind", "text", "typed", "pasted_chars", "raw_len", "segment",
+        "line_no", "build", "looks_pasted", "role",
     )
 
     def __init__(self, **kw):
@@ -277,6 +277,7 @@ def read_session(path: Path) -> tuple[list[Turn], Counter, list[dict]]:
             raw, _ = extract_text(rec.get("message", {}).get("content"))
             text = strip_wrappers(raw or "")
             uid = rec.get("uuid") or f"line{line_no}"
+            typed, pasted = paste_split(text)
             turns.append(Turn(
                 turn_id=f"{session_id}:{uid}",
                 session_id=session_id,
@@ -286,6 +287,8 @@ def read_session(path: Path) -> tuple[list[Turn], Counter, list[dict]]:
                 project=project,
                 kind="authored",
                 text=text,
+                typed=typed,
+                pasted_chars=len(pasted),
                 raw_len=len(raw or ""),
                 segment=segment,
                 line_no=line_no,
@@ -374,6 +377,189 @@ def _cutoff(days: int) -> str | None:
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc)
     return (now - datetime.timedelta(days=days)).isoformat().replace("+00:00", "Z")
+
+
+# --------------------------------------------------------------------------
+# paste extraction
+# --------------------------------------------------------------------------
+
+# A record can be genuinely authored and still be mostly someone else's bytes:
+# a two-line preamble followed by a pasted report. Classification is a decision
+# about the record; this is a decision about the bytes inside it.
+#
+# Deliberately conservative — it only splits on markers that a person is
+# unlikely to type mid-message in a chat prompt. Under-trimming leaves noise
+# that shows up as histogram outliers; over-trimming silently deletes speech,
+# which is worse and invisible.
+PASTE_MARKER = re.compile(
+    r"^(?:"
+    r"```|~~~"                 # fenced code
+    r"|#{1,6}\s+\S"            # markdown heading
+    r"|\s*\|.*\|\s*$"          # table row
+    r"|(?:From|To|Subject|Sent|On .{0,40}wrote):\s"   # quoted mail
+    r"|\s{4,}\S"               # indented block
+    r"|<[a-zA-Z!/][^>]*>\s*$"  # lone markup line
+    r")",
+    re.M,
+)
+MIN_SPLIT_LEN = 800   # below this, a marker is more likely to be real writing
+
+
+def paste_split(text: str) -> tuple[str, str]:
+    """(typed, pasted). Best effort, and honest about being best effort."""
+    if len(text) < MIN_SPLIT_LEN:
+        return text, ""
+    m = PASTE_MARKER.search(text)
+    if not m:
+        return text, ""
+    head = text[:m.start()].rstrip()
+    tail = text[m.start():]
+    # A marker in the first few characters means the whole record is pasted.
+    # A marker near the end means the "paste" is a signature or a snippet, and
+    # trimming it buys nothing.
+    if len(tail) < 200:
+        return text, ""
+    return head, tail
+
+
+# --------------------------------------------------------------------------
+# dry tier
+# --------------------------------------------------------------------------
+
+HEDGES = (
+    "maybe", "perhaps", "might", "possibly", "probably", "sort of", "kind of",
+    "i think", "i guess", "i suppose", "seems", "somewhat", "a bit", "a little",
+    "not sure", "if that makes sense", "or something", "i wonder", "could be",
+)
+POLITENESS = (
+    "please", "thanks", "thank you", "sorry", "appreciate", "if you could",
+    "would you mind", "no rush", "when you get a chance", "great", "nice work",
+    "well done", "perfect", "awesome", "love it",
+)
+PROFANITY = (
+    "damn", "hell", "crap", "shit", "fuck", "fucking", "goddamn", "wtf",
+    "bullshit", "ass", "dammit",
+)
+REPAIR = (
+    "no, i said", "that's not", "thats not", "i said", "actually no", "wrong",
+    "not what i", "you missed", "try again", "revert", "undo", "nope",
+    "still broken", "still failing", "didn't work", "doesn't work",
+)
+IMPERATIVE_STARTS = (
+    "add", "build", "change", "check", "clean", "commit", "create", "delete",
+    "do", "don't", "dont", "draft", "drop", "explain", "find", "fix", "get",
+    "give", "go", "implement", "install", "keep", "let's", "lets", "look",
+    "make", "move", "open", "print", "pull", "push", "put", "read", "remove",
+    "rename", "replace", "run", "search", "set", "show", "start", "stop",
+    "switch", "take", "tell", "try", "update", "use", "write", "walk", "help",
+)
+FIRST_P_SING = ("i", "me", "my", "mine", "myself", "i'm", "im", "i've", "i'll", "i'd")
+FIRST_P_PLUR = ("we", "us", "our", "ours", "ourselves", "we're", "we've", "we'll", "let's", "lets")
+SECOND_P = ("you", "your", "yours", "yourself", "you're", "youre", "you've", "you'll")
+
+WORD = re.compile(r"[a-z']+")
+SENTENCE = re.compile(r"[^.!?\n]+[.!?]?")
+
+
+def tokens(text: str) -> list[str]:
+    return WORD.findall(text.lower())
+
+
+def phrase_rate(text: str, phrases, per: int = 1000) -> float:
+    """Hits per `per` words. Multi-word phrases counted as substrings."""
+    low = " " + " ".join(tokens(text)) + " "
+    n = len(tokens(text))
+    if not n:
+        return 0.0
+    hits = sum(low.count(" " + p + " ") if " " not in p else low.count(p)
+               for p in phrases)
+    return per * hits / n
+
+
+# Words people actually shout. A closed list, because the alternatives failed:
+# a naive \b[A-Z]{3,}\b count scored 11.35 per 1k words on the reference corpus
+# and was almost entirely domain jargon (OPL, QKD, LDPC, BLE). Gating on "the
+# word also appears lowercase somewhere" failed too — PQC, AWS and FPGA all
+# appear lowercase inside paths and commands, so acronyms passed anyway.
+#
+# Reading either number as "shouting" would be exactly the horoscope failure
+# this project exists to avoid: a real measurement of the wrong thing.
+EMPHATIC = frozenset("""
+    NOT NEVER ALWAYS ALL NONE ONLY EVERY MUST STOP DO DONT DON'T PLEASE
+    NO YES REALLY VERY NOW THIS THAT AND BUT ANY EVER JUST STILL WHY
+    WRONG BROKEN WORKS WORKING FAILED READ USE
+""".split())
+
+
+def caps_words(text: str) -> int:
+    """Emphatic capitals only — ordinary words shouted, not vocabulary."""
+    return sum(1 for w in re.findall(r"\b[A-Z']{2,}\b", text) if w in EMPHATIC)
+
+
+def mood(text: str) -> str:
+    """question / imperative / statement, on the first sentence."""
+    s = text.strip()
+    if not s:
+        return "statement"
+    first = (SENTENCE.match(s).group(0) if SENTENCE.match(s) else s).strip()
+    if first.endswith("?"):
+        return "question"
+    w = tokens(first)
+    if w and w[0] in IMPERATIVE_STARTS:
+        return "imperative"
+    return "statement"
+
+
+def local_hour(ts: str | None):
+    if not ts:
+        return None
+    import datetime
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.astimezone()
+
+
+def slope(points: list[tuple[float, float]]) -> float | None:
+    """Least-squares slope. None when there isn't enough spread to mean anything."""
+    if len(points) < 3:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    denom = sum((x - mx) ** 2 for x in xs)
+    if denom == 0:
+        return None
+    return sum((x - mx) * (y - my) for x, y in points) / denom
+
+
+def measure(texts: list[str]) -> dict:
+    """The measures that apply to any bag of authored text."""
+    joined = "\n".join(texts)
+    toks = tokens(joined)
+    n = len(toks) or 1
+    lens = [len(t) for t in texts] or [0]
+    moods = Counter(mood(t) for t in texts)
+    counts = Counter(toks)
+    return {
+        "turns": len(texts),
+        "words": len(toks),
+        "median_chars": int(statistics.median(lens)),
+        "mean_chars": int(statistics.mean(lens)),
+        "p95_chars": sorted(lens)[int(0.95 * (len(lens) - 1))],
+        "hedging_per_1k": round(phrase_rate(joined, HEDGES), 2),
+        "politeness_per_1k": round(phrase_rate(joined, POLITENESS), 2),
+        "profanity_per_1k": round(phrase_rate(joined, PROFANITY), 2),
+        "repair_per_1k": round(phrase_rate(joined, REPAIR), 2),
+        "caps_per_1k": round(1000 * caps_words(joined) / n, 2),
+        "question_ratio": round(moods["question"] / max(1, len(texts)), 3),
+        "imperative_ratio": round(moods["imperative"] / max(1, len(texts)), 3),
+        "we_vs_i": round(
+            sum(counts[w] for w in FIRST_P_PLUR) /
+            max(1, sum(counts[w] for w in FIRST_P_SING)), 3),
+        "you_per_1k": round(1000 * sum(counts[w] for w in SECOND_P) / n, 2),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -725,6 +911,211 @@ def cmd_label(args) -> int:
     return 0
 
 
+REPORT_HOME = Path(os.environ.get("SHRINK_HOME", Path.home() / ".shrink"))
+
+
+def _bar(v: float, hi: float, width: int = 28) -> str:
+    n = 0 if hi <= 0 else int(round(width * v / hi))
+    return "█" * n + "·" * (width - n)
+
+
+def cmd_dry(args) -> int:
+    """The sincere tier. No model calls, no network."""
+    corpus = Corpus.load(days=args.days)
+    if not corpus.turns:
+        print("Nothing to report on. Either no sessions, or none in the window.",
+              file=sys.stderr)
+        return 2
+    if len(corpus.turns) < 50:
+        print(f"Only {len(corpus.turns)} authored turns in the window. "
+              f"That is not enough to say anything about you — come back later.",
+              file=sys.stderr)
+        return 2
+
+    typed = [t.typed for t in corpus.turns if t.typed.strip()]
+    trimmed = sum(t.pasted_chars for t in corpus.turns)
+    total = sum(len(t.text) for t in corpus.turns)
+    m = measure(typed)
+
+    W = 64
+    print("=" * W)
+    print("  shrink — dry tier".ljust(W - 12) + "no model calls")
+    print("=" * W)
+    print()
+    print(f"  {len(corpus.turns):,} authored turns over {args.days} days, "
+          f"{len(corpus.files)} sessions")
+    if trimmed:
+        print(f"  {trimmed:,} of {total:,} characters trimmed as pasted "
+              f"({100*trimmed/total:.0f}%) — measuring the {m['words']:,} words "
+              f"you actually typed")
+    print()
+
+    # ---- circadian -------------------------------------------------------
+    print("  WHEN YOU WORK")
+    print()
+    hours = Counter()
+    for t in corpus.turns:
+        h = local_hour(t.ts)
+        if h:
+            hours[h.hour] += 1
+    hi = max(hours.values()) if hours else 1
+    for h in range(24):
+        n = hours.get(h, 0)
+        mark = "  " if 6 <= h < 22 else " ·"
+        print(f"    {h:02d}:00 {_bar(n, hi)} {n:>4}{mark}")
+    night = sum(n for h, n in hours.items() if h < 6 or h >= 22)
+    print()
+    print(f"    {100*night/max(1,sum(hours.values())):.0f}% of what you say, "
+          f"you say after 22:00 or before 06:00")
+    print()
+
+    dow = Counter()
+    for t in corpus.turns:
+        h = local_hour(t.ts)
+        if h:
+            dow[h.strftime("%a")] += 1
+    hi = max(dow.values()) if dow else 1
+    for d in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"):
+        print(f"    {d} {_bar(dow.get(d, 0), hi)} {dow.get(d, 0):>4}")
+    weekend = dow.get("Sat", 0) + dow.get("Sun", 0)
+    print()
+    print(f"    {100*weekend/max(1,sum(dow.values())):.0f}% of it on a weekend")
+    print()
+
+    # ---- register --------------------------------------------------------
+    print("  HOW YOU TALK")
+    print()
+    rows = [
+        ("median message", f"{m['median_chars']} chars",
+         f"mean {m['mean_chars']}, p95 {m['p95_chars']}"),
+        ("questions", f"{100*m['question_ratio']:.0f}%", "of messages"),
+        ("imperatives", f"{100*m['imperative_ratio']:.0f}%", "of messages"),
+        ("hedging", f"{m['hedging_per_1k']}", "per 1k words"),
+        ("politeness", f"{m['politeness_per_1k']}", "per 1k words"),
+        ("profanity", f"{m['profanity_per_1k']}", "per 1k words"),
+        ("repair phrases", f"{m['repair_per_1k']}", "per 1k words"),
+        ("emphatic caps", f"{m['caps_per_1k']}", "per 1k words"),
+        ("we : I", f"{m['we_vs_i']}", "plural to singular"),
+        ("second person", f"{m['you_per_1k']}", "per 1k words"),
+    ]
+    for label, val, note in rows:
+        print(f"    {label:<18} {val:>12}   {note}")
+    print()
+
+    interrupts = [e for e in corpus.events if e["kind"] == "interrupt"]
+    print(f"    you interrupted {len(interrupts)} times "
+          f"({len(interrupts)/max(1,len(corpus.files)):.2f} per session)")
+    print()
+
+    # ---- per project -----------------------------------------------------
+    byproj = defaultdict(list)
+    for t in corpus.turns:
+        if t.typed.strip():
+            byproj[t.project].append(t.typed)
+    big = [kv for kv in sorted(byproj.items(), key=lambda kv: -len(kv[1]))[:6]
+           if len(kv[1]) >= 20]
+    if len(big) < 2:
+        print("  WHO YOU ARE, BY PROJECT")
+        print()
+        print(f"    Only one project has enough turns to compare "
+              f"({len(byproj)} seen). Cross-project register needs at least two.")
+        print()
+    else:
+        print("  WHO YOU ARE, BY PROJECT")
+        print()
+        print(f"    {'project':<26}{'turns':>7}{'median':>8}{'hedge':>7}"
+              f"{'polite':>8}{'imper':>7}")
+        for proj, texts in big:
+            pm = measure(texts)
+            name = proj.rsplit("/", 1)[-1][:24] or proj[:24]
+            print(f"    {name:<26}{pm['turns']:>7}{pm['median_chars']:>8}"
+                  f"{pm['hedging_per_1k']:>7}{pm['politeness_per_1k']:>8}"
+                  f"{100*pm['imperative_ratio']:>6.0f}%")
+        print()
+
+    # ---- long baseline ---------------------------------------------------
+    if corpus.history:
+        import datetime
+        months = defaultdict(list)
+        for h in corpus.history:
+            ts = h.get("ts")
+            if not ts:
+                continue
+            d = datetime.datetime.fromtimestamp(ts / 1000 if ts > 1e11 else ts)
+            months[d.strftime("%Y-%m")].append(h["text"])
+        # Thin months make the slope noise, not signal.
+        keys = sorted(k for k, v in months.items() if len(v) >= 100)
+        if len(keys) >= 3:
+            print("  OVER TIME  (history.jsonl — longer than the 30-day window)")
+            print()
+            print(f"    {'month':<10}{'prompts':>9}{'median':>8}{'hedge':>8}"
+                  f"{'polite':>8}{'profan':>8}")
+            series = {}
+            for i, k in enumerate(keys):
+                pm = measure(months[k])
+                print(f"    {k:<10}{pm['turns']:>9}{pm['median_chars']:>8}"
+                      f"{pm['hedging_per_1k']:>8}{pm['politeness_per_1k']:>8}"
+                      f"{pm['profanity_per_1k']:>8}")
+                for field in ("median_chars", "hedging_per_1k",
+                              "politeness_per_1k", "profanity_per_1k"):
+                    series.setdefault(field, []).append((i, pm[field]))
+            print()
+            for field, pts in series.items():
+                sl = slope(pts)
+                if sl is None:
+                    continue
+                ys = [y for _, y in pts]
+                base = statistics.mean(ys)
+                # Percent-of-first is meaningless when the first month is near
+                # zero -- it produced a "214% decline" on profanity. Normalize
+                # against the series mean and always show the endpoints, so the
+                # reader can check the claim against the numbers above.
+                pct = 0.0 if base == 0 else 100 * sl * (len(pts) - 1) / base
+                a, b = ys[0], ys[-1]
+                fmt = (lambda v: f"{v:.2f}") if base < 10 else (lambda v: f"{v:.0f}")
+                net = 0.0 if base == 0 else 100 * (b - a) / base
+                # A trend line and the endpoints can disagree when the series
+                # peaks in the middle. Saying "up 11%" about 2.04 -> 2.03 is
+                # true of the fit and false of the person.
+                if (sl > 0) != (net > 0) and abs(net) < 10:
+                    print(f"    {field:<20} ~  no net change, peaked mid-series"
+                          f"   ({fmt(a)} → {fmt(b)})")
+                    continue
+                if abs(pct) < 5:
+                    print(f"    {field:<20} —  flat   ({fmt(a)} → {fmt(b)})")
+                    continue
+                arrow = "↑" if sl > 0 else "↓"
+                print(f"    {field:<20} {arrow} {abs(pct):3.0f}%   "
+                      f"({fmt(a)} → {fmt(b)}) over {len(pts)} months")
+            print()
+
+    # ---- metrics series --------------------------------------------------
+    if not args.no_series:
+        REPORT_HOME.mkdir(parents=True, exist_ok=True)
+        series_file = REPORT_HOME / "metrics.jsonl"
+        row = {"summary_version": SUMMARY_VERSION, "days": args.days,
+               "sessions": len(corpus.files), "trimmed_chars": trimmed,
+               "interrupts": len(interrupts), **m}
+        with series_file.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+        prior = [json.loads(l) for l in series_file.open() if l.strip()]
+        print(f"  metrics appended to {series_file} ({len(prior)} runs)")
+        if len(prior) > 1:
+            print()
+            print("  SINCE YOUR FIRST RUN")
+            base = prior[0]
+            for field in ("median_chars", "hedging_per_1k", "politeness_per_1k",
+                          "profanity_per_1k", "imperative_ratio"):
+                a, b = base.get(field), row.get(field)
+                if not a:
+                    continue
+                d = 100 * (b - a) / a
+                if abs(d) >= 1:
+                    print(f"    {field:<20} {'+' if d > 0 else ''}{d:.0f}%")
+    print()
+    return 0
+
+
 def cmd_stub(name: str):
     def run(args) -> int:
         print(f"`shrink {name}` is not implemented yet.", file=sys.stderr)
@@ -752,6 +1143,12 @@ def main(argv=None) -> int:
     e = sub.add_parser("eval", help="score the denoiser against hand labels")
     e.add_argument("--labels", default="eval/labels.jsonl")
     e.set_defaults(func=cmd_eval)
+
+    dry = sub.add_parser("dry", help="the sincere tier — stats only, no model calls")
+    dry.add_argument("--days", type=int, default=30)
+    dry.add_argument("--no-series", action="store_true",
+                     help="do not append to the metrics series")
+    dry.set_defaults(func=cmd_dry)
 
     lb = sub.add_parser("label", help="serve a local labeling UI over the eval set")
     lb.add_argument("--labels", default="eval/labels.jsonl")
