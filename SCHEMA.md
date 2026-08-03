@@ -123,6 +123,45 @@ inlines sidechains — but they are not the safety margin. `toolUseResult` is.
 
 There is no documented flag meaning "the human typed this." `[obs]`
 
+### Bare harness markers
+
+Two record shapes carry no wrapper tag and no `isMeta` flag, and are
+structurally indistinguishable from typed text:
+
+- `[Request interrupted by user]` / `[Request interrupted by user for tool use]`
+  — 34 occurrences `[measured]`
+- `[Image: source: /abs/path/...]` — 3 occurrences, and note it carries an
+  absolute path straight through the identifier barrier `[measured]`
+
+Neither was findable by scanning for tags; both were found by hand-labeling.
+**Structural scans cannot enumerate unstructured markers** — the eval set is the
+only instrument that catches this class, which is the argument for keeping it
+rather than treating M1 as a one-time gate.
+
+An interrupt is dropped from the text corpus and recorded as an **event**
+instead: it is not speech, but it is behaviour, and abandonment is precisely
+what the panel is looking for. 0.69 per session on the reference corpus.
+
+### Eval methodology
+
+`shrink eval` re-derives predictions from source rather than reading the
+prediction stored at sample time — otherwise a fixed classifier can never
+register as fixed, and the eval silently grades a snapshot of itself.
+
+Results, reference corpus:
+
+| batch | rows | predicted-authored | precision | recall |
+|---|---|---|---|---|
+| initial | 122 | 43 | 0.956 → 1.000 after fix | 1.000 |
+| **held-out** | **60** | **30** | **1.000** | **1.000** |
+
+The initial batch became training data the moment its failures were used to fix
+the classifier, so the held-out number is the reportable one. With zero errors
+in 30 predicted-authored rows, true precision is **≥ 0.90 at 95% confidence** —
+the point estimate is 1.000 but the sample does not by itself establish ≥ 0.95.
+Residual noise is expected to surface visibly as outliers in the M2 histogram,
+which is a cheaper detector than more labeling.
+
 ### Wrapper stripping
 
 `<system-reminder>`, `<command-name>`, `<command-message>`, `<command-args>`,
