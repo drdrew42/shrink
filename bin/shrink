@@ -69,6 +69,11 @@ DANGLING_RE = re.compile(rf"<({_TAGS})>.*\Z", re.DOTALL)
 # delivered by the harness, not typed.
 LEADING_RE = re.compile(rf"\s*<({_TAGS})>")
 
+# Bare harness markers: not tagged, not flagged, indistinguishable from typed
+# text by structure alone. Found by hand-labeling, not by the tag scan.
+INTERRUPT_RE = re.compile(r"^\s*\[Request interrupted by user[^\]]*\]\s*$")
+IMAGE_MARKER_RE = re.compile(r"^\s*\[Image:\s*source:[^\]]*\]\s*$")
+
 
 # --------------------------------------------------------------------------
 # discovery
@@ -197,6 +202,12 @@ def classify(rec: dict) -> tuple[str, str]:
         return ("tool_result", reason) if reason == "tool_result" else ("unrecognized", reason)
     if rec.get("isMeta"):
         return "meta", "isMeta"
+    # An interrupt is not speech, but it *is* behaviour — the tool records it as
+    # an event (see Corpus.interrupts) and drops it from the text corpus.
+    if INTERRUPT_RE.match(text):
+        return "meta", "interrupt_marker"
+    if IMAGE_MARKER_RE.match(text):
+        return "meta", "image_marker"
     if not strip_wrappers(text):
         # Wholly injected: a task notification, a slash-command echo, a caveat.
         # Machine-delivered, so meta — "empty" is reserved for records that were
@@ -207,9 +218,10 @@ def classify(rec: dict) -> tuple[str, str]:
     return "authored", reason
 
 
-def read_session(path: Path) -> tuple[list[Turn], Counter]:
+def read_session(path: Path) -> tuple[list[Turn], Counter, list[dict]]:
     """Parse one session file. Never throws on content."""
     turns: list[Turn] = []
+    events: list[dict] = []
     stats: Counter = Counter()
     session_id = path.stem
     project = project_label(path)
@@ -251,6 +263,14 @@ def read_session(path: Path) -> tuple[list[Turn], Counter]:
             kind, reason = classify(rec)
             stats[f"user:{kind}"] += 1
             stats[f"reason:{reason}"] += 1
+            if reason == "interrupt_marker":
+                events.append({
+                    "kind": "interrupt",
+                    "session_id": session_id,
+                    "ts": rec.get("timestamp"),
+                    "project": project,
+                    "segment": segment,
+                })
             if kind != "authored":
                 continue
 
@@ -274,7 +294,7 @@ def read_session(path: Path) -> tuple[list[Turn], Counter]:
                 role="user",
             ))
 
-    return turns, stats
+    return turns, stats, events
 
 
 def read_history(path: Path = HISTORY_FILE) -> list[dict]:
@@ -306,21 +326,24 @@ def read_history(path: Path = HISTORY_FILE) -> list[dict]:
 # --------------------------------------------------------------------------
 
 class Corpus:
-    def __init__(self, turns, stats, files, history):
+    def __init__(self, turns, stats, files, history, events=None):
         self.turns = turns
         self.stats = stats
         self.files = files
         self.history = history
+        self.events = events or []
 
     @classmethod
     def load(cls, days: int | None = None) -> "Corpus":
         files = session_files()
         turns: list[Turn] = []
+        events: list[dict] = []
         stats: Counter = Counter()
         seen_uuids: dict[str, str] = {}
         for f in files:
-            t, s = read_session(f)
+            t, s, ev = read_session(f)
             stats.update(s)
+            events.extend(ev)
             for turn in t:
                 # Cheap insurance against resume-replay. Not observed on the
                 # reference build, but free.
@@ -337,7 +360,8 @@ class Corpus:
             cutoff = _cutoff(days)
             if cutoff:
                 turns = [t for t in turns if (t.ts or "") >= cutoff]
-        return cls(turns, stats, files, history)
+                events = [e for e in events if (e.get("ts") or "") >= cutoff]
+        return cls(turns, stats, files, history, events)
 
     @property
     def authored_chars(self) -> int:
@@ -388,6 +412,10 @@ def cmd_digest(args) -> int:
         print(f"    span              {corpus.turns[0].ts} -> {corpus.turns[-1].ts}")
         pasted = sum(1 for t in corpus.turns if t.looks_pasted)
         print(f"    flagged as paste  {pasted:>8,}")
+    interrupts = sum(1 for e in corpus.events if e["kind"] == "interrupt")
+    if interrupts:
+        per = interrupts / max(1, len(corpus.files))
+        print(f"    interrupts        {interrupts:>8,}  ({per:.2f}/session)")
     print()
     print("  long baseline (history.jsonl)")
     if corpus.history:
@@ -449,6 +477,11 @@ def cmd_sample(args) -> int:
     most likely to be wrong.
     """
     files = session_files()
+    seen: set[str] = set()
+    for prev in (args.exclude or []):
+        pp = Path(prev)
+        if pp.is_file():
+            seen |= {json.loads(l)["turn_id"] for l in pp.open() if l.strip()}
     buckets: dict[str, list[dict]] = defaultdict(list)
     for f in files:
         session_id = f.stem
@@ -470,9 +503,12 @@ def cmd_sample(args) -> int:
                 bucket = "authored_wrapped"
             if kind == "authored" and looks_pasted(stripped):
                 bucket = "authored_paste_flagged"
+            turn_id = f"{session_id}:{rec.get('uuid') or line_no}"
+            if turn_id in seen:
+                continue
             shown = stripped or raw or preview(rec)
             buckets[bucket].append({
-                "turn_id": f"{session_id}:{rec.get('uuid') or line_no}",
+                "turn_id": turn_id,
                 "predicted": kind,
                 "reason": reason,
                 "label": None,
@@ -517,8 +553,43 @@ def cmd_sample(args) -> int:
     return 0
 
 
+def find_records(turn_ids: set[str]) -> dict[str, dict]:
+    """turn_id -> raw record, by scanning the sessions named in the ids.
+
+    Also the lookup `excerpt` and `verify` are built on: quotes travel by id and
+    are re-read from source, never re-typed by any layer.
+    """
+    wanted: dict[str, set[str]] = defaultdict(set)
+    for tid in turn_ids:
+        sid, _, uid = tid.partition(":")
+        wanted[sid].add(uid)
+    found: dict[str, dict] = {}
+    for f in session_files():
+        uids = wanted.get(f.stem)
+        if not uids:
+            continue
+        for line_no, line in enumerate(f.open(errors="replace")):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            uid = rec.get("uuid") or str(line_no)
+            if uid in uids:
+                found[f"{f.stem}:{uid}"] = rec
+    return found
+
+
 def cmd_eval(args) -> int:
-    """Score the denoiser against hand labels."""
+    """Score the denoiser against hand labels.
+
+    Predictions are re-derived from source rather than read from the label file.
+    A stored prediction measures the classifier as it was when the sample was
+    drawn, which means a fixed bug never shows up as fixed.
+    """
     path = Path(args.labels)
     if not path.is_file():
         print(f"No label file at {path}. Run `shrink sample` first.", file=sys.stderr)
@@ -529,24 +600,41 @@ def cmd_eval(args) -> int:
         print(f"{len(rows)} rows, none labeled yet.", file=sys.stderr)
         return 2
 
-    tp = sum(1 for r in labeled if r["predicted"] == "authored" and r["label"] == "authored")
-    fp = sum(1 for r in labeled if r["predicted"] == "authored" and r["label"] != "authored")
-    fn = sum(1 for r in labeled if r["predicted"] != "authored" and r["label"] == "authored")
+    records = find_records({r["turn_id"] for r in labeled})
+    missing = 0
+    for r in labeled:
+        rec = records.get(r["turn_id"])
+        if rec is None:
+            missing += 1
+            r["_now"] = r["predicted"]
+            r["_reason"] = r["reason"] + " (stale: record aged out)"
+        else:
+            kind, reason = classify(rec)
+            r["_now"], r["_reason"] = kind, reason
+
+    tp = sum(1 for r in labeled if r["_now"] == "authored" and r["label"] == "authored")
+    fp = sum(1 for r in labeled if r["_now"] == "authored" and r["label"] != "authored")
+    fn = sum(1 for r in labeled if r["_now"] != "authored" and r["label"] == "authored")
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
 
-    print(f"labeled {len(labeled)} of {len(rows)}")
+    print(f"labeled {len(labeled)} of {len(rows)}"
+          + (f"   ({missing} records no longer on disk)" if missing else ""))
     print(f"  precision  {precision:.3f}   (target >= 0.95)")
     print(f"  recall     {recall:.3f}")
     print(f"  tp {tp}  fp {fp}  fn {fn}")
     if fp or fn:
         print("\nmisclassified:")
         for r in labeled:
-            hit = r["predicted"] == "authored"
+            hit = r["_now"] == "authored"
             truth = r["label"] == "authored"
             if hit != truth:
-                print(f"  [{r['bucket']}] predicted={r['predicted']} label={r['label']}"
-                      f"  reason={r['reason']}\n    {r['excerpt'][:160]!r}")
+                print(f"  [{r['bucket']}] predicted={r['_now']} label={r['label']}"
+                      f"  reason={r['_reason']}\n    {r['excerpt'][:160]!r}")
+    drift = [r for r in labeled if r["_now"] != r["predicted"]]
+    if drift:
+        print(f"\n{len(drift)} rows reclassified since the sample was drawn "
+              f"(classifier changed, not the corpus)")
     return 0 if precision >= 0.95 else 1
 
 
@@ -657,6 +745,8 @@ def main(argv=None) -> int:
     s = sub.add_parser("sample", help="emit a stratified labeling set")
     s.add_argument("-n", type=int, default=200)
     s.add_argument("--out", default="eval/labels.jsonl")
+    s.add_argument("--exclude", nargs="*", default=[],
+                   help="label files whose rows to skip (draw a clean holdout)")
     s.set_defaults(func=cmd_sample)
 
     e = sub.add_parser("eval", help="score the denoiser against hand labels")
