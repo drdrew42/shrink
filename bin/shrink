@@ -2074,8 +2074,18 @@ def cmd_render(args) -> int:
     for line in text.splitlines():
         if line.startswith((">", "#", "<sub")):
             continue
+        # A theorist named anywhere in a paragraph governs the third-person
+        # pronouns after it: "Goffman would say X. ... He would call it Y." is
+        # correct prose. Flagging it trains the reader to ignore the warning,
+        # which is worse than not having one. The check is advisory, so it
+        # errs toward silence in the ambiguous case and toward noise only when
+        # no theorist has been named at all.
+        governed = False
         for sent in re.findall(r"[^.!?\n]+[.!?]", line):
-            if THIRD.search(sent) and not NAMES.search(sent):
+            if NAMES.search(sent):
+                governed = True
+                continue
+            if THIRD.search(sent) and not governed:
                 suspect.append(" ".join(sent.split())[:110])
     if suspect:
         print(f"  WARNING: {len(suspect)} sentence(s) may refer to the reader in "
