@@ -1498,6 +1498,41 @@ def cmd_verify(args) -> int:
     string; redacting first would make byte-exactness unsatisfiable, and the
     temptation would then be to weaken the check rather than reorder the steps.
     """
+    # Per-claim semantics: a claim's quote need only appear in ONE of its cited
+    # turns, which is what the renderer enforces. Checking every (claim, turn)
+    # pair instead reports failures that are not failures -- a trap worth
+    # closing, having fallen into it twice.
+    if args.findings:
+        rows = [json.loads(l) for l in Path(args.findings).open() if l.strip()]
+        claims = [(f.get("theorist", "?"), c)
+                  for f in rows for c in f.get("claims", [])]
+        records = find_records({t for _, c in claims for t in c.get("evidence", [])})
+        ok = bad = thin = 0
+        for who, c in claims:
+            ev = c.get("evidence") or []
+            if len(ev) < 2:
+                thin += 1
+                print(f"THIN     {who}: {len(ev)} citation(s) — renderer will drop")
+                continue
+            q = c.get("quote")
+            if not q:
+                print(f"NOQUOTE  {who}: {str(c.get('claim'))[:70]}…")
+                bad += 1
+                continue
+            hit = any(q in strip_wrappers(
+                extract_text(records[t].get("message", {}).get("content"))[0] or "")
+                for t in ev if t in records)
+            if hit:
+                ok += 1
+                if args.verbose:
+                    print(f"OK       {who}: {q[:60]!r}")
+            else:
+                bad += 1
+                print(f"FAIL     {who}: {q[:70]!r} not in any cited turn")
+        print(f"\n{ok} claim(s) verified, {bad} failed, {thin} under-cited "
+              f"({len(claims)} checked)")
+        return 0 if bad == 0 and thin == 0 else 1
+
     quotes = []
     if args.file:
         quotes = [json.loads(l) for l in Path(args.file).open() if l.strip()]
@@ -1777,6 +1812,11 @@ def cmd_audit(args) -> int:
         print(f"  {count:>4}  {label}")
     for label, hit in findings[:12]:
         print(f"    {label}: {hit[:90]}")
+    print("\nNot checked: names of people and organisations written into your "
+          "own prose.\nThe barrier masks structured identifiers — paths, mail, "
+          "keys, hosts — but a\ncolleague's name typed mid-sentence is "
+          "indistinguishable from any other word.\nRead the quotes before "
+          "sharing a report that includes other people.")
     if not args.share_mode:
         print("\nNote: a report rendered without --share intentionally restores "
               "project names for its owner. Re-run render --share and audit that "
@@ -2119,7 +2159,9 @@ def main(argv=None) -> int:
     vf = sub.add_parser("verify", help="check quotes byte-exact against source")
     vf.add_argument("turn_id", nargs="?")
     vf.add_argument("--quote")
-    vf.add_argument("--file", help="jsonl of {turn_id, quote}")
+    vf.add_argument("--file", help="jsonl of {turn_id, quote} — per-pair check")
+    vf.add_argument("--findings", help="findings jsonl — per-claim check, "
+                    "matching what the renderer enforces")
     vf.add_argument("--verbose", action="store_true")
     vf.set_defaults(func=cmd_verify)
 
