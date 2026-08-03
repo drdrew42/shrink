@@ -3,6 +3,7 @@ description: Read your own Claude Code history and hand back a psychological rea
 argument-hint: "[here] [--days N] [--offline]"
 ---
 
+`shrink` is on PATH once the plugin is enabled — call it directly, not by path.
 Never read `~/.claude/projects/` directly. Everything goes through `shrink` so
 the user needs one permission rule, not a prompt storm.
 
@@ -38,7 +39,8 @@ Outliers plus a control set, identifiers pseudonymised on the way out.
 
 ## 4. The panel
 
-Run `freud`, `jung`, and `goffman` **in parallel**, each with the same packet
+Run the `shrink:freud`, `shrink:jung`, and `shrink:goffman` agents **in
+parallel**, each with the same packet
 and no other context. Do not summarise the packet for them and do not hand any
 of them an observation the others lack — a finding that only exists because you
 primed one theorist will not reproduce on anyone else's corpus.
@@ -47,7 +49,7 @@ Each writes findings JSON. Merge into one JSONL, one object per theorist.
 
 ## 5. The report
 
-Run `analyst` over the theorists' claims plus the packet. It writes the report:
+Run the `shrink:analyst` agent over the theorists' claims plus the packet. It writes the report:
 one voice, second person, merged sections.
 
 ```

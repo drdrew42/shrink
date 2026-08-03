@@ -64,8 +64,14 @@ why a corpus that looks enormous is actually small enough to reason about whole.
 
 ```
 /plugin marketplace add drdrew42/shrink
-/plugin install shrink
+/plugin install shrink@drdrew42
+/reload-plugins
 ```
+
+Then run `/shrink:shrink`. Plugin commands and agents are namespaced, hence the
+doubled name.
+
+**`/plugin` does not work over Remote Control** — install at the machine.
 
 That is the whole thing — a Claude Code "marketplace" is just a git repo with a
 `.claude-plugin/marketplace.json` in it. No review queue, no listing.
