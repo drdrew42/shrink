@@ -302,7 +302,7 @@ unsatisfiable.
 Implemented and verified end to end:
 
 ```
-before: /Users/me/github/proj, mail a@b.com, host 10.10.20.10,
+before: /Users/me/github/proj, mail a@b.com, host 192.0.2.10,
         token sk-ant-api03-…, https://host.example/health
 after : <PATH>, mail <EMAIL>, host <IP>, token <KEY>, <URL>/health
 ```
