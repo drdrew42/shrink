@@ -561,6 +561,97 @@ def measure(texts: list[str]) -> dict:
 
 
 # --------------------------------------------------------------------------
+# outliers
+# --------------------------------------------------------------------------
+
+# Sampling only extremes characterises a person who does not exist, so evidence
+# is outliers *plus* a seeded control set. The control is what makes a claim
+# about the extremes meaningful — it is the baseline register to compare against.
+FEATURES = ("chars", "caps", "hedging", "profanity", "hour_oddity",
+            "gap_before", "similarity_prev")
+
+
+def jaccard(a: str, b: str) -> float:
+    sa, sb = set(tokens(a)), set(tokens(b))
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def turn_features(turns: list) -> list[dict]:
+    """Per-turn feature vector. Ordered input; gaps are within-session only."""
+    hours = Counter()
+    for t in turns:
+        h = local_hour(t.ts)
+        if h:
+            hours[h.hour] += 1
+    total = sum(hours.values()) or 1
+
+    out = []
+    prev_by_session: dict[str, object] = {}
+    for t in turns:
+        txt = t.typed or ""
+        h = local_hour(t.ts)
+        prev = prev_by_session.get(t.session_id)
+        gap = 0.0
+        if prev is not None and prev.ts and t.ts:
+            import datetime
+            try:
+                a = datetime.datetime.fromisoformat(prev.ts.replace("Z", "+00:00"))
+                b = datetime.datetime.fromisoformat(t.ts.replace("Z", "+00:00"))
+                gap = max(0.0, (b - a).total_seconds())
+            except ValueError:
+                gap = 0.0
+        out.append({
+            "turn_id": t.turn_id,
+            "ts": t.ts,
+            "project": t.project,
+            "text": txt,
+            "chars": float(len(txt)),
+            "caps": float(caps_words(txt)),
+            "hedging": phrase_rate(txt, HEDGES),
+            "profanity": phrase_rate(txt, PROFANITY),
+            # How unusual this hour is *for this person*, not "is it late".
+            "hour_oddity": 0.0 if not h else 1.0 - (hours[h.hour] / total),
+            "gap_before": gap,
+            "similarity_prev": jaccard(txt, (prev.typed or "")) if prev else 0.0,
+        })
+        prev_by_session[t.session_id] = t
+    return out
+
+
+def zscores(rows: list[dict]) -> list[dict]:
+    for f in FEATURES:
+        vals = [r[f] for r in rows]
+        mu = statistics.mean(vals) if vals else 0.0
+        sd = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+        for r in rows:
+            r[f"z_{f}"] = 0.0 if sd == 0 else (r[f] - mu) / sd
+    return rows
+
+
+def select_evidence(rows: list[dict], per_feature: int = 3,
+                    control: int = 12, seed: int = 1) -> tuple[list, list]:
+    """(outliers, controls). Deterministic — a re-run isolates whether the model
+    moved or the evidence did."""
+    rows = zscores(rows)
+    picked: dict[str, dict] = {}
+    for f in FEATURES:
+        ranked = sorted(rows, key=lambda r: -abs(r[f"z_{f}"]))
+        for r in ranked[:per_feature]:
+            if abs(r[f"z_{f}"]) < 1.5:
+                continue
+            entry = picked.setdefault(r["turn_id"], dict(r, why=[]))
+            entry["why"].append((f, round(r[f"z_{f}"], 2)))
+    outliers = sorted(picked.values(),
+                      key=lambda r: -max(abs(z) for _, z in r["why"]))
+    rest = [r for r in rows if r["turn_id"] not in picked]
+    step = max(1, len(rest) // max(1, control))
+    controls = rest[::step][:control]
+    return outliers, controls
+
+
+# --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
 
@@ -1142,6 +1233,29 @@ def cmd_dry(args) -> int:
           f"({len(interrupts)/max(1,len(corpus.files)):.2f} per session)")
     print()
 
+    # ---- outliers --------------------------------------------------------
+    rows = turn_features(corpus.turns)
+    outliers, controls = select_evidence(rows)
+    if outliers:
+        print("  OUTLIERS")
+        print()
+        print(f"    {len(outliers)} turns sit more than 1.5σ from your own "
+              f"baseline on at least one measure.")
+        print("    Listed without interpretation — extremes are where a claim")
+        print("    might live, not a claim in themselves.")
+        print()
+        for r in outliers[:8]:
+            why = ", ".join(f"{f} {z:+.1f}σ" for f, z in r["why"][:3])
+            when = local_hour(r["ts"])
+            stamp = when.strftime("%a %H:%M") if when else "?"
+            snippet = " ".join(r["text"].split())[:74]
+            print(f"    {stamp}  {why}")
+            print(f"      {snippet}…")
+        print()
+        print(f"    plus {len(controls)} control turns sampled from the middle "
+              f"of your distribution.")
+        print()
+
     # ---- per project -----------------------------------------------------
     byproj = defaultdict(list)
     for t in corpus.turns:
@@ -1373,6 +1487,149 @@ def cmd_purge(args) -> int:
     return 0
 
 
+def cmd_packet(args) -> int:
+    """Build the evidence packet handed identically to every theorist.
+
+    Barriered on the way out. Quotes travel with their turn_id so the renderer
+    can look them up from source; no layer downstream re-types quoted text.
+    """
+    corpus = Corpus.load(days=args.days)
+    if len(corpus.turns) < 50:
+        print(f"Only {len(corpus.turns)} authored turns — not enough.",
+              file=sys.stderr)
+        return 2
+    bar = build_barrier()
+    rows = turn_features(corpus.turns)
+    outliers, controls = select_evidence(rows, per_feature=args.per_feature,
+                                         control=args.control)
+
+    def pack(r, why=None):
+        return {
+            "turn_id": r["turn_id"],
+            "when": (local_hour(r["ts"]).strftime("%a %Y-%m-%d %H:%M")
+                     if local_hour(r["ts"]) else None),
+            "project": bar.apply(r["project"]),
+            "text": bar.apply(r["text"])[:args.max_chars],
+            "unusual": [{"measure": f, "sigma": z} for f, z in (why or [])],
+        }
+
+    typed = [t.typed for t in corpus.turns if t.typed.strip()]
+    packet = {
+        "summary_version": SUMMARY_VERSION,
+        "window_days": args.days,
+        "coverage": {
+            "sessions": len(corpus.files),
+            "authored_turns": len(corpus.turns),
+            "span": [corpus.turns[0].ts, corpus.turns[-1].ts],
+            "long_baseline_prompts": len(corpus.history),
+            "note": ("Sessions are swept at 30 days by default; the long "
+                     "baseline reaches further but holds prompts only, with no "
+                     "responses or outcomes."),
+        },
+        "statistics": measure(typed),
+        "interrupts": len([e for e in corpus.events if e["kind"] == "interrupt"]),
+        "outliers": [pack(r, r["why"]) for r in outliers],
+        "controls": [pack(r) for r in controls],
+        "rules": [
+            "Every claim carries at least two turn_id citations, or it is dropped.",
+            "Quote by turn_id. Do not retype quoted text; the renderer looks it up.",
+            "Over-read behaviour, never diagnose. What the corpus cannot support, "
+            "you may not assert.",
+            "Identifiers are pseudonymised. <REPO_A> is a stable label, not a name.",
+        ],
+    }
+    dest = Path(args.out)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(packet, indent=2))
+    print(f"wrote {dest}")
+    print(f"  {len(packet['outliers'])} outliers, {len(packet['controls'])} controls, "
+          f"{len(json.dumps(packet)):,} bytes")
+    return 0
+
+
+def cmd_render(args) -> int:
+    """Deterministic report assembly. A script with a template, not a model.
+
+    Verification runs against source before redaction; the renderer then
+    re-hydrates pseudonyms locally. No fifth chance to garble a quote.
+    """
+    packet = json.loads(Path(args.packet).read_text())
+    findings = [json.loads(l) for l in Path(args.findings).open() if l.strip()]
+    bar = build_barrier()
+
+    kept, dropped = [], []
+    all_ids = {c["turn_id"] for f in findings for c in f.get("claims", [])
+               for c in [{"turn_id": t} for t in c.get("evidence", [])]}
+    records = find_records(all_ids)
+
+    for f in findings:
+        good = []
+        for c in f.get("claims", []):
+            ev = c.get("evidence") or []
+            if len(ev) < 2:
+                dropped.append((f.get("theorist"), c.get("claim"), "fewer than 2 citations"))
+                continue
+            quote = c.get("quote")
+            if quote:
+                hit = False
+                for tid in ev:
+                    rec = records.get(tid)
+                    if rec is None:
+                        continue
+                    text, _ = extract_text(rec.get("message", {}).get("content"))
+                    if quote in strip_wrappers(text or ""):
+                        hit = True
+                        break
+                if not hit:
+                    dropped.append((f.get("theorist"), c.get("claim"),
+                                    "quote failed byte-exact verification"))
+                    continue
+            good.append(c)
+        if good:
+            kept.append({**f, "claims": good})
+
+    out = []
+    st = packet["statistics"]
+    cov = packet["coverage"]
+    out.append("# shrink\n")
+    out.append(f"_{cov['authored_turns']:,} things you typed across "
+               f"{cov['sessions']} sessions in {packet['window_days']} days._\n")
+    out.append("## The sincere part\n")
+    out.append(f"- median message **{st['median_chars']} characters**")
+    out.append(f"- **{100*st['question_ratio']:.0f}%** of messages ask something")
+    out.append(f"- hedging **{st['hedging_per_1k']}** per 1k words, "
+               f"politeness **{st['politeness_per_1k']}**, "
+               f"profanity **{st['profanity_per_1k']}**")
+    out.append(f"- you say *we* {st['we_vs_i']}× as often as *I*")
+    out.append(f"- you interrupted **{packet['interrupts']}** times\n")
+    out.append(f"> {cov['note']}\n")
+
+    for f in kept:
+        out.append(f"## {f.get('theorist', 'panel').title()}\n")
+        for c in f["claims"]:
+            out.append(f"{c['claim']}\n")
+            if c.get("quote"):
+                out.append(f"> {bar.rehydrate(c['quote'])}\n")
+            out.append(f"<sub>{', '.join(c['evidence'][:4])}</sub>\n")
+
+    if dropped:
+        out.append("## Dropped\n")
+        out.append(f"{len(dropped)} claims did not survive verification:\n")
+        for who, claim, why in dropped:
+            out.append(f"- **{who}** — {why}: {str(claim)[:90]}…")
+        out.append("")
+
+    text = "\n".join(out)
+    dest = Path(args.out) if args.out else REPORT_HOME / "reports" / "report.md"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text)
+    print(f"wrote {dest}")
+    print(f"  {sum(len(f['claims']) for f in kept)} claims kept, "
+          f"{len(dropped)} dropped")
+    print("  This report is overwritten by the next run. Save it if you want it.")
+    return 0
+
+
 def cmd_stub(name: str):
     def run(args) -> int:
         print(f"`shrink {name}` is not implemented yet.", file=sys.stderr)
@@ -1433,8 +1690,19 @@ def main(argv=None) -> int:
     pg = sub.add_parser("purge", help="wipe reports, metrics series, and cache")
     pg.set_defaults(func=cmd_purge)
 
-    rn = sub.add_parser("render", help="build the report [M5]")
-    rn.set_defaults(func=cmd_stub("render"))
+    pk = sub.add_parser("packet", help="build the evidence packet for the panel")
+    pk.add_argument("--days", type=int, default=30)
+    pk.add_argument("--out", default="packet.json")
+    pk.add_argument("--per-feature", type=int, default=3)
+    pk.add_argument("--control", type=int, default=12)
+    pk.add_argument("--max-chars", type=int, default=900)
+    pk.set_defaults(func=cmd_packet)
+
+    rn = sub.add_parser("render", help="assemble the report from panel findings")
+    rn.add_argument("--packet", default="packet.json")
+    rn.add_argument("--findings", required=True, help="jsonl, one object per theorist")
+    rn.add_argument("--out")
+    rn.set_defaults(func=cmd_render)
 
     args = p.parse_args(argv)
     return args.func(args)
