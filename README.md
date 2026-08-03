@@ -9,13 +9,17 @@ machine.
 
 **Status: pre-release.** M1–M3 done. The denoiser scores **1.000 precision /
 1.000 recall** on a 60-row held-out sample (182 turns hand-labeled). The dry
-tier, `excerpt`, `verify` and the identifier barrier all work. The panel does
-not exist yet.
+tier, `excerpt`, `verify` and the identifier barrier all work. **The panel runs
+end to end** — three theorists against one barriered packet, 15 claims kept and
+0 dropped on the reference corpus, with fabricated quotes and single-citation
+claims confirmed to drop.
 
 ```sh
 shrink dry --days 30          # the sincere tier, offline
 shrink excerpt <turn-id>      # context around a turn, segment-aware
 shrink verify --file q.jsonl  # quotes, byte-exact or dropped
+shrink packet --out p.json    # barriered evidence for the panel
+shrink render --findings f.jsonl
 shrink purge                  # wipe reports, metrics, cache
 ```
 
