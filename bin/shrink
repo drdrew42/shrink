@@ -1541,12 +1541,14 @@ def cmd_doctor(args) -> int:
     files = session_files()
     stats: Counter = Counter()
     turns = 0
+    chars = 0
     builds: Counter = Counter()
     projects: Counter = Counter()
     for f in files:
         t, st, _ = read_session(f)
         stats.update(st)
         turns += len(t)
+        chars += sum(len(x.text) for x in t)
         projects[project_label(f)] += len(t)
         for x in t:
             if x.build:
@@ -1572,7 +1574,7 @@ def cmd_doctor(args) -> int:
         "projects": len(projects),
         "projects_over_20_turns": sum(1 for v in projects.values() if v >= 20),
         "authored_turns": turns,
-        "authored_chars": None,
+        "authored_chars": chars,
         "history_prompts": len(hist),
         "history_span_days": None,
         "builds_seen": dict(builds.most_common(8)),
@@ -1635,6 +1637,100 @@ def cmd_doctor(args) -> int:
         print()
         print("  This output contains counts and versions only — no text you "
               "wrote.\n  Safe to share when reporting a problem.")
+    return 0
+
+
+FEEDBACK_REPO = "drdrew42/shrink"
+FEEDBACK_ISSUE = 1
+
+
+def _doctor_report() -> dict:
+    """The shareable half of doctor, as data."""
+    import io, contextlib
+    buf = io.StringIO()
+    ns = argparse.Namespace(json=True)
+    with contextlib.redirect_stdout(buf):
+        cmd_doctor(ns)
+    return json.loads(buf.getvalue())
+
+
+def cmd_feedback(args) -> int:
+    """Post a beta report as a comment on the project's feedback issue.
+
+    Everything this sends is counts and versions plus answers the user types
+    themselves. No prompt text, ever. And nothing is sent until the exact
+    payload has been shown and explicitly confirmed -- posting to GitHub is
+    public, permanent, and attributed to the sender's account.
+    """
+    import shutil
+    import subprocess
+
+    report = _doctor_report()
+
+    def ask(prompt: str, default: str = "") -> str:
+        if not sys.stdin.isatty():
+            return default
+        try:
+            return input(prompt).strip() or default
+        except EOFError:
+            return default
+
+    ran = args.ran or ask("Did `shrink dry` run without errors? (y/n/partly) ", "")
+    drops = args.drops or ask("Any claims dropped by the renderer? (count, or 'none') ", "")
+    verdict = args.verdict or ask(
+        "Did the report read as true, or as horoscope? (a sentence) ", "")
+
+    body = [
+        "### shrink beta report",
+        "",
+        f"- **dry tier ran:** {ran or '_(not answered)_'}",
+        f"- **claims dropped:** {drops or '_(not answered)_'}",
+        f"- **true or horoscope:** {verdict or '_(not answered)_'}",
+        "",
+        "<details><summary>doctor output — counts and versions only</summary>",
+        "",
+        "```json",
+        json.dumps(report, indent=2),
+        "```",
+        "",
+        "</details>",
+    ]
+    text = "\n".join(body)
+
+    print("=" * 68)
+    print(text)
+    print("=" * 68)
+    print()
+    print(f"This will be posted publicly to {args.repo} issue #{args.issue},")
+    print("attributed to your GitHub account. It contains no text you wrote to")
+    print("Claude — only the counts above and your own answers.")
+    print()
+
+    if args.dry_run:
+        print("--dry-run: nothing sent. Copy the block above if you would rather "
+              "paste it yourself.")
+        return 0
+
+    if not shutil.which("gh"):
+        print("`gh` not found. Copy the block above into "
+              f"https://github.com/{args.repo}/issues/{args.issue}")
+        return 0
+
+    confirm = ask("Type 'send' to post, anything else to cancel: ", "")
+    if confirm.lower() != "send":
+        print("Cancelled. Nothing was sent.")
+        return 0
+
+    proc = subprocess.run(
+        ["gh", "issue", "comment", str(args.issue), "--repo", args.repo,
+         "--body-file", "-"],
+        input=text, text=True, capture_output=True)
+    if proc.returncode != 0:
+        print(f"gh failed: {proc.stderr.strip()[:300]}", file=sys.stderr)
+        print(f"Paste it manually at "
+              f"https://github.com/{args.repo}/issues/{args.issue}")
+        return 1
+    print(proc.stdout.strip() or "posted")
     return 0
 
 
@@ -2009,6 +2105,17 @@ def main(argv=None) -> int:
     dr = sub.add_parser("doctor", help="report this machine's corpus shape; safe to share")
     dr.add_argument("--json", action="store_true")
     dr.set_defaults(func=cmd_doctor)
+
+    fb = sub.add_parser("feedback",
+                        help="post a beta report to the project's feedback issue")
+    fb.add_argument("--repo", default=FEEDBACK_REPO)
+    fb.add_argument("--issue", type=int, default=FEEDBACK_ISSUE)
+    fb.add_argument("--dry-run", action="store_true",
+                    help="show the payload, send nothing")
+    fb.add_argument("--ran")
+    fb.add_argument("--drops")
+    fb.add_argument("--verdict")
+    fb.set_defaults(func=cmd_feedback)
 
     ad = sub.add_parser("audit", help="scan a rendered report for leaked identifiers")
     ad.add_argument("report")
