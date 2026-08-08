@@ -73,6 +73,11 @@ doubled name.
 
 **`/plugin` does not work over Remote Control** — install at the machine.
 
+**After updating, start a new session.** `bin/shrink` is put on PATH when a
+session begins, so a session that was running during the update keeps resolving
+the old version. Updating and then debugging a bug that was already fixed is an
+easy hour to lose.
+
 That is the whole thing — a Claude Code "marketplace" is just a git repo with a
 `.claude-plugin/marketplace.json` in it. No review queue, no listing.
 

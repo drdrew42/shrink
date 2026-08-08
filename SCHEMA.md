@@ -217,10 +217,22 @@ span a compaction, and a silently-wrong excerpt is worse than a short one — it
 hands a theorist a stimulus that did not precede the response. `excerpt` must
 report truncation at a boundary rather than returning the wrong neighbours.
 
-> **Open:** zero `compact_boundary` records in the reference corpus despite
-> `autoCompactEnabled: true`. Either no session reached the threshold, or the
-> subtype is named differently in 2.1.2xx. Probe before relying on the break
-> detection.
+> **Probe #1 — resolved, and not the way expected.** Zero `compact_boundary`
+> records across 48 sessions and builds 2.1.200–2.1.220. This is not because no
+> session got large: one climbed to **996,517 tokens of a 1,000,000 window**
+> across 1,407 assistant turns, growing monotonically to the last message, and
+> ended there. Auto-compact was enabled throughout and never fired.
+>
+> The `system` subtypes that *do* occur are `turn_duration`, `local_command`,
+> `bridge_status`, `away_summary`, `scheduled_task_fire`. No compaction subtype
+> under any name. `[measured]`
+>
+> So the reference machine cannot produce this record, and waiting for one is
+> not a plan. The segment-break path is covered by a **synthetic fixture**
+> (`tests/make_fixture.py`, `tests/test_compaction.sh`) built from the
+> community-observed shape. That tests our *handling*, not the shape's accuracy
+> — if the real record differs, the handling is still correct for the record we
+> believe in, and this paragraph is where to start looking when it isn't.
 
 ---
 
